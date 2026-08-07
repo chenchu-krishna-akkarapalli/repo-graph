@@ -1,0 +1,16 @@
+name: fact-checker
+version: 1.0.0
+description: A specialized subagent that verifies code syntax, structure, and rule compliance.
+model:
+  provider: gemini
+  name: gemini-3.5-flash
+  temperature: 0.0
+  max_tokens: 4096
+
+capabilities:
+  tools:
+    - path: ../../tools/repo_graph_tools.yaml
+
+compliance:
+  rules_path: ../../RULES.md
+  duties_path: DUTIES.md

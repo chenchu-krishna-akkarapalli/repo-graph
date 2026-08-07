@@ -1,0 +1,36 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Rust / Tauri build output
+src-tauri/target
+
+# Generated graph cache — machine-specific and can reach hundreds of MB.
+# Never commit: rebuild with `mcp_server index <repo>`.
+.repograph/
+*.bak
+
+# Host-specific MCP registrations contain absolute local paths.
+# Ship .codex/config.example.toml instead.
+.codex/config.toml
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

@@ -1,0 +1,163 @@
+@import "tailwindcss";
+
+@theme {
+  --color-canvas-base: #07080B;
+  --color-canvas-dot: #161B26;
+  --color-panel-bg: #0F1218;
+  --color-accent-border: #1E2433;
+  --color-active-purple: #8B5CF6;
+  --color-impact-red: #EA605C;
+  --color-impact-yellow: #FFC93C;
+
+  --color-node-ts-bg: #0F2038;
+  --color-node-ts-border: #3B82F6;
+  --color-node-py-bg: #0F2C1A;
+  --color-node-py-border: #10B981;
+  --color-node-rs-bg: #2C180B;
+  --color-node-rs-border: #F97316;
+
+  --color-node-folder-bg: #151A23;
+  --color-node-folder-border: #334155;
+  --color-status-synced: #10B981;
+  --color-status-indexing: #F59E0B;
+  --color-status-stale: #EF4444;
+
+  --font-sans: "Inter", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Fira Code", "Cascadia Mono", monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: var(--color-canvas-base);
+  color: #d7dde4;
+  font-family: var(--font-sans);
+}
+
+/* ---- Custom Scrollbars ---- */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* ---- Impact simulation & status animations ---- */
+
+@keyframes impact-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(234, 96, 92, 0.65); }
+  50% { box-shadow: 0 0 0 7px rgba(234, 96, 92, 0); }
+}
+
+@keyframes edge-flash {
+  0%, 100% { stroke-opacity: 1; }
+  50% { stroke-opacity: 0.35; }
+}
+
+@keyframes status-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.impact-node {
+  animation: impact-pulse 1.1s ease-in-out infinite;
+}
+
+.impact-edge path {
+  animation: edge-flash 0.9s ease-in-out infinite;
+}
+
+.status-dot-pulse {
+  animation: status-pulse 1.2s ease-in-out infinite;
+}
+
+/* React Flow chrome overrides for the dark canvas */
+.react-flow__attribution {
+  background: transparent;
+  color: #3a4553;
+}
+
+.react-flow__controls {
+  box-shadow: none;
+}
+
+.react-flow__controls-button {
+  /* Fitts's Law: comfortably clickable zoom/fit controls */
+  width: 28px;
+  height: 28px;
+  background: var(--color-panel-bg);
+  border-bottom: 1px solid var(--color-accent-border);
+  fill: #d7dde4;
+}
+
+.react-flow__controls-button:hover {
+  background: var(--color-accent-border);
+}
+
+.react-flow__nodesselection-rect,
+.react-flow__selection {
+  background: rgba(139, 92, 246, 0.08);
+  border: 1px dashed var(--color-active-purple);
+}
+
+/* ---- O(1) hover highlighting (see src/lib/hoverHighlight.ts) ----
+   Dimming and re-lighting are driven entirely by a generated stylesheet, so
+   no React component re-renders on mouse move. The dim rules deliberately
+   live in that generated sheet rather than here: toggling any class or
+   attribute on the canvas container would invalidate styles for every
+   descendant (~99 ms with 1,200 nodes mounted), which is exactly the stall
+   this architecture exists to remove.
+
+   Only `opacity` transitions — GPU-composited, unlike the `transition-all`
+   these nodes used to carry. No `will-change`: at 1,000+ nodes it would
+   promote a layer per node and blow out compositor memory. */
+
+.graph-node {
+  transition: opacity 120ms linear, box-shadow 120ms linear, border-color 150ms linear;
+}
+
+.graph-edge {
+  transition: opacity 120ms linear;
+}
+
+/* Indeterminate progress bar for the large-graph ingest overlay. */
+@keyframes ingest-slide {
+  0% { transform: translateX(-110%); }
+  100% { transform: translateX(310%); }
+}
+
+.ingest-bar {
+  animation: ingest-slide 1.1s ease-in-out infinite;
+}
+
+/* ---- Agent query radar telemetry animation ---- */
+@keyframes radar-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(139, 92, 246, 0.8);
+    outline: 2px solid rgba(139, 92, 246, 0.8);
+  }
+  100% {
+    box-shadow: 0 0 0 15px rgba(139, 92, 246, 0);
+    outline: 2px solid rgba(139, 92, 246, 0);
+  }
+}
+
+.agent-radar-node {
+  animation: radar-pulse 1.0s cubic-bezier(0, 0, 0.2, 1) infinite;
+  border-color: var(--color-active-purple) !important;
+  box-shadow: 0 0 10px rgba(139, 92, 246, 0.4);
+}

@@ -1,0 +1,26 @@
+name: repo-graph-architect
+version: 1.0.0
+description: A context-engineered engineering coordinator agent specialized in analyzing repositories and maintaining token efficiency.
+model:
+  provider: gemini
+  name: gemini-3.5-flash
+  temperature: 0.2
+  max_tokens: 8192
+
+capabilities:
+  skills:
+    - path: skills/code-review
+  tools:
+    - path: tools/repo_graph_tools.yaml
+  workflows:
+    - path: workflows/pr_review.yaml
+
+context_engineering:
+  max_context_tokens: 32000
+  compression_threshold: 20000
+  scratchpad_path: memory/runtime/context.md
+  manifest_tool: repo_graph.get_manifest
+
+compliance:
+  rules_path: RULES.md
+  duties_path: DUTIES.md

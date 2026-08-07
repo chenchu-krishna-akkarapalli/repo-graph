@@ -1,0 +1,10 @@
+name: fact-checker
+role: verifier
+architecture: "CEPA-v1.1"
+context_budget: signatures_only
+tools:
+  - repograph_search
+  - repograph_explore
+  - repograph_callers
+  - repograph_impact
+writes: false

@@ -1,0 +1,23 @@
+# Repo Graph agent workspace descriptor.
+# Generated once; edit freely — re-indexing never overwrites this file.
+name: project-map
+version: 0.1.0
+architecture: "CEPA-v1.1"
+
+context_stack:
+  instructions: RULES.md
+  duties: DUTIES.md
+  persona: SOUL.md
+  short_term_memory: memory/runtime/context.md
+  long_term_memory: knowledge/
+
+discovery_sequence:
+  - repograph_status
+  - repograph_files
+  - repograph_search
+  - repograph_explore  # signature_only: true
+
+agents:
+  - agents/fact-checker
+skills:
+  - skills/code-review

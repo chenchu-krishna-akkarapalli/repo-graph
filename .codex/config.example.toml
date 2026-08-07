@@ -1,0 +1,34 @@
+# Repo Graph — Codex MCP registration (example)
+#
+# Copy this file to `.codex/config.toml` (git-ignored) or merge it into your
+# user-level `~/.codex/config.toml`. Two DIFFERENT paths go in here — do not
+# use one for both:
+#
+#   `command` — where the Repo Graph BINARY lives: your Repo Graph checkout's
+#                `src-tauri/target/{debug,release}/mcp_server(.exe)`, or the
+#                desktop app's install directory. This is fixed per machine
+#                and has nothing to do with which project you're analyzing.
+#                The desktop app's "Integrate Agent" panel (left sidebar,
+#                bottom) generates this snippet with the real path already
+#                filled in — prefer copying that over editing this by hand.
+#   `args`    — the project you want Repo Graph to analyze (its `.repograph/`
+#                cache lives there). Almost always NOT the same folder as
+#                `command` above, unless you are pointing Repo Graph at its
+#                own source.
+#
+# Replace REPOGRAPH_BINARY_PATH and TARGET_PROJECT_PATH below, then restart
+# Codex — MCP tool discovery only runs at client startup, so a newly built
+# binary is not picked up by an already-running session.
+#
+# Windows: use `mcp_server.exe`.  macOS / Linux: use `mcp_server` (no suffix).
+#
+# REPOGRAPH_MCP_TOOLS is REQUIRED to see more than one tool: when it is unset
+# the server's tools/list returns only `repograph_explore` by design.
+
+[mcp_servers.repo-graph]
+command = "REPOGRAPH_BINARY_PATH/mcp_server.exe"
+args = ["TARGET_PROJECT_PATH"]
+startup_timeout_sec = 120
+
+[mcp_servers.repo-graph.env]
+REPOGRAPH_MCP_TOOLS = "explore,files,node,search,impact,callers,callees,status"
