@@ -39,6 +39,8 @@ export default function TopToolbar() {
   const languageFilters = useGraphStore((s) => s.languageFilters)
   const toggleLanguageFilter = useGraphStore((s) => s.toggleLanguageFilter)
   const goHome = useGraphStore((s) => s.goHome)
+  const minRank = useGraphStore((s) => s.minRank)
+  const setMinRank = useGraphStore((s) => s.setMinRank)
   const inputRef = useRef<HTMLInputElement>(null)
 
   const [symbolResults, setSymbolResults] = useState<SymbolSearchResult[]>([])
@@ -195,6 +197,20 @@ export default function TopToolbar() {
           <span className="font-mono text-[10px] text-violet-300 bg-violet-500/10 border border-violet-500/30 px-2.5 py-1 rounded-full shrink-0">
             {matchCount} matches
           </span>
+        )}
+
+        {/* The rank filter lives in the Core tab, but hiding nodes is not
+            something the canvas may do quietly — this is always visible while
+            it is on, and clears it in one click. */}
+        {minRank > 0 && (
+          <button
+            onClick={() => setMinRank(0)}
+            title="Rank filter is hiding low-centrality nodes — click to show all"
+            className="flex h-7 shrink-0 cursor-pointer items-center gap-1.5 rounded-full border border-amber-500/40 bg-amber-500/10 px-2.5 font-mono text-[10px] text-amber-300 transition-colors hover:bg-amber-500/20"
+          >
+            Rank ≥ {minRank.toFixed(2)}
+            <X size={11} />
+          </button>
         )}
 
         <div className="flex items-center gap-1.5">

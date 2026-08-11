@@ -1133,6 +1133,8 @@ pub fn load_graph_from_db(conn: &Connection) -> Result<Graph> {
             in_degree: 0,
             out_degree: 0,
             symbols,
+            rank_score: 0.0,
+            rank_order: 0,
         });
     }
     
@@ -1190,14 +1192,19 @@ pub fn load_graph_from_db(conn: &Connection) -> Result<Graph> {
     
     let symbol_edges = get_all_symbol_edges(conn).unwrap_or_default();
     
-    Ok(Graph {
+    let mut graph = Graph {
         schema_version: 1,
         nodes: nodes_list,
         edges,
         external_dependencies,
         warnings,
         symbol_edges,
-    })
+    };
+    // The DB stores edges, not centrality — rank is derived, so it is computed
+    // here rather than persisted and risked going stale after an incremental
+    // re-index.
+    crate::rank::compute_ranks(&mut graph);
+    Ok(graph)
 }
 
 /// Files holding an edge that points **into** `rel_path`.

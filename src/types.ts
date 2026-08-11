@@ -22,6 +22,17 @@ export interface GraphNode {
   in_degree: number
   out_degree: number
   symbols: ExtractedSymbol[]
+  /**
+   * Normalized dependency-graph centrality in (0, 1], 1.0 for the most central
+   * file. Computed by the Rust `rank` module on every graph load, so a cache
+   * written before ranking existed is refreshed rather than reported as 0.
+   *
+   * Optional here because `RepoGraph` is also constructed in tests and older
+   * caches deserialize without it.
+   */
+  rank_score?: number
+  /** Dense 1-based position in the ranking. */
+  rank_order?: number
 }
 
 /**

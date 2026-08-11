@@ -100,6 +100,24 @@ export function agentActivityTargets(
   return targets
 }
 
+/**
+ * Files in descending centrality — the UI counterpart of the MCP tool's
+ * `top_k`.
+ *
+ * Sorts on `rank_order` (dense, computed once by the backend over the whole
+ * graph) rather than re-deriving an order from `rank_score`, so the numbers
+ * shown here and the `#N` badges on the canvas can never disagree. Unranked
+ * nodes — an older cache, or a test fixture — sort last instead of colonising
+ * position 1, which is what `rank_order: 0` would otherwise do.
+ */
+export function rankedFiles(graph: RepoGraph | null, limit?: number): GraphNode[] {
+  if (!graph) return []
+  const ranked = graph.nodes
+    .filter((n) => (n.rank_order ?? 0) > 0)
+    .sort((a, b) => (a.rank_order ?? 0) - (b.rank_order ?? 0))
+  return limit === undefined ? ranked : ranked.slice(0, limit)
+}
+
 interface GraphState {
   graph: RepoGraph | null
   status: SyncStatus
@@ -117,6 +135,9 @@ interface GraphState {
   searchLatencyMs: number
   languageFilters: ReadonlySet<string>
   collapsedDirs: ReadonlySet<string>
+  /** Hide canvas nodes scoring below this centrality. `0` shows everything. */
+  minRank: number
+  setMinRank: (value: number) => void
 
   impactSource: string | null
   impactSet: ReadonlySet<string>
@@ -198,6 +219,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   // files would make the map lie about what is in the repo.
   languageFilters: new Set<string>(KNOWN_LANGUAGES),
   collapsedDirs: EMPTY,
+  minRank: 0,
 
   impactSource: null,
   impactSet: EMPTY,
@@ -405,6 +427,10 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       else next.add(language)
       return { languageFilters: next }
     }),
+
+  // Clamped rather than trusted: this drives what the canvas shows, and a
+  // value outside [0, 1] would silently blank it.
+  setMinRank: (value) => set({ minRank: Math.min(1, Math.max(0, value)) }),
 
   toggleDir: (dir) =>
     set((s) => {

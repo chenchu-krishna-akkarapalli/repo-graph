@@ -5,6 +5,7 @@ pub mod manifest;
 pub mod mcp_server;
 pub mod parsers;
 pub mod paths;
+pub mod rank;
 pub mod tokens;
 pub mod tree;
 pub mod walker;

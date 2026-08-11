@@ -12,20 +12,24 @@ import {
   Check,
   Share2,
 } from 'lucide-react'
-import { useGraphStore } from '../store'
+import { rankedFiles, useGraphStore } from '../store'
 import { tauriInvoke } from '../lib/loadGraph'
 import { httpMethodOf, METHOD_BADGE, METHOD_ORDER } from '../lib/httpMethod'
 import { copyContextPrompt } from '../lib/promptExporter'
 import { copyAsciiLayout } from '../lib/layoutExporter'
 import type { FileTreeNode } from '../types'
 
-type NavTab = 'explorer' | 'routes' | 'context'
+type NavTab = 'explorer' | 'core' | 'routes' | 'context'
 
 const NAV_TABS: { key: NavTab; label: string }[] = [
   { key: 'explorer', label: 'Explorer' },
+  { key: 'core', label: 'Core' },
   { key: 'routes', label: 'Routes' },
   { key: 'context', label: 'Context' },
 ]
+
+/** How many ranked files the Core tab lists — the UI's `top_k`. */
+const CORE_LIST_LIMIT = 30
 
 /** Shown when no workspace is open — never a machine-specific path. */
 const PLACEHOLDER_ROOT = '/absolute/path/to/your/project'
@@ -306,6 +310,7 @@ export default function LeftSidebar() {
               )}
             </div>
           )}
+          {tab === 'core' && <CoreTab />}
           {tab === 'routes' && <RoutesTab />}
           {tab === 'context' && <ContextTab />}
         </div>
@@ -442,6 +447,112 @@ export default function LeftSidebar() {
         </div>
       )}
     </>
+  )
+}
+
+/**
+ * The repo's architectural core, highest dependency-graph centrality first —
+ * the same ordering `repograph_files` serves an agent, for a human.
+ *
+ * Also owns the canvas rank filter. The two belong together: the list answers
+ * "what matters here", the slider applies that answer to the canvas, and the
+ * node count under it is what stops the filter from quietly hiding the repo.
+ */
+function CoreTab() {
+  const graph = useGraphStore((s) => s.graph)
+  const focusNode = useGraphStore((s) => s.focusNode)
+  const selected = useGraphStore((s) => s.selected)
+  const minRank = useGraphStore((s) => s.minRank)
+  const setMinRank = useGraphStore((s) => s.setMinRank)
+
+  const ranked = useMemo(() => rankedFiles(graph, CORE_LIST_LIMIT), [graph])
+  const totalRanked = useMemo(() => rankedFiles(graph).length, [graph])
+  const visibleCount = useMemo(
+    () => (graph?.nodes ?? []).filter((n) => (n.rank_score ?? 0) >= minRank).length,
+    [graph, minRank],
+  )
+  const totalCount = graph?.nodes.length ?? 0
+
+  if (totalRanked === 0) {
+    return (
+      <div className="px-3 py-4 text-xs leading-relaxed text-white/35">
+        No ranking available. Re-index the workspace — ranks are computed on
+        load, so an older cache picks them up on the next open.
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-3 p-2.5">
+      <div className="space-y-1.5 rounded-lg border border-white/10 bg-[#121620]/70 p-2.5">
+        <div className="flex items-center justify-between">
+          <span className="text-[10px] font-bold uppercase tracking-wider text-white/50">
+            Canvas Rank Filter
+          </span>
+          <button
+            onClick={() => setMinRank(0)}
+            disabled={minRank === 0}
+            className="border-0 bg-transparent p-0 text-[9px] text-violet-400 transition-opacity hover:underline disabled:opacity-30 cursor-pointer"
+          >
+            reset
+          </button>
+        </div>
+        <input
+          type="range"
+          min={0}
+          max={0.9}
+          step={0.01}
+          value={minRank}
+          onChange={(e) => setMinRank(Number(e.target.value))}
+          aria-label="Minimum node rank shown on the canvas"
+          className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-white/10 accent-violet-500"
+        />
+        <div className="flex justify-between font-mono text-[9px] text-white/40">
+          <span>Rank ≥ {minRank.toFixed(2)}</span>
+          <span className={visibleCount < totalCount ? 'text-amber-300' : ''}>
+            {visibleCount.toLocaleString()} / {totalCount.toLocaleString()} nodes
+          </span>
+        </div>
+      </div>
+
+      <div>
+        <div className="px-1 pb-1 font-mono text-[9px] font-semibold text-white/35">
+          TOP {Math.min(CORE_LIST_LIMIT, totalRanked)} OF {totalRanked.toLocaleString()}
+        </div>
+        <div className="space-y-1">
+          {ranked.map((n) => {
+            const active = selected.has(n.path)
+            const hidden = (n.rank_score ?? 0) < minRank
+            return (
+              <button
+                key={n.path}
+                onClick={() => focusNode(n.path)}
+                title={`${n.path}\ncentrality ${(n.rank_score ?? 0).toFixed(3)} · ${n.in_degree} inbound edges`}
+                className={[
+                  'flex h-7 w-full cursor-pointer items-center gap-1.5 rounded-lg border px-2 text-left transition-all',
+                  active
+                    ? 'border-violet-500/40 bg-violet-500/15'
+                    : 'border-white/[0.05] bg-white/[0.02] hover:border-white/10 hover:bg-white/[0.06]',
+                  hidden ? 'opacity-35' : '',
+                ].join(' ')}
+              >
+                <span className="w-7 shrink-0 rounded bg-white/[0.06] text-center font-mono text-[9px] tabular-nums text-white/45">
+                  #{n.rank_order}
+                </span>
+                <span
+                  className={`truncate font-mono text-[11px] ${active ? 'font-semibold text-violet-300' : 'text-white/80'}`}
+                >
+                  {n.path.split('/').pop()}
+                </span>
+                <span className="ml-auto shrink-0 font-mono text-[9px] text-white/30">
+                  {n.in_degree > 0 ? `↓${n.in_degree}` : ''}
+                </span>
+              </button>
+            )
+          })}
+        </div>
+      </div>
+    </div>
   )
 }
 

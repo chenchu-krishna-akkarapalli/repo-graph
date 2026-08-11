@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AgentActivity, RepoGraph } from './types'
-import { agentActivityTargets, primarySelection, useGraphStore } from './store'
+import { agentActivityTargets, primarySelection, rankedFiles, useGraphStore } from './store'
 
 function graph(partial: Partial<RepoGraph> = {}): RepoGraph {
   return {
@@ -41,6 +41,55 @@ const activity = (partial: Partial<AgentActivity> = {}): AgentActivity =>
     timestamp: Date.now(),
     ...partial,
   }) as AgentActivity
+
+describe('rankedFiles', () => {
+  const ranked = (path: string, rank_order: number, rank_score: number) => ({
+    ...node(path),
+    rank_order,
+    rank_score,
+  })
+
+  it('orders by the backend rank, not by insertion or score re-derivation', () => {
+    const g = graph({
+      nodes: [ranked('c.ts', 3, 0.2), ranked('a.ts', 1, 1), ranked('b.ts', 2, 0.6)],
+    })
+    expect(rankedFiles(g).map((n) => n.path)).toEqual(['a.ts', 'b.ts', 'c.ts'])
+  })
+
+  it('drops unranked nodes instead of seating them at #1', () => {
+    // `rank_order: 0` sorts first numerically — an old cache would otherwise
+    // fill the entire "core files" list with unranked entries.
+    const g = graph({ nodes: [node('old.ts'), ranked('hub.ts', 1, 1)] })
+    expect(rankedFiles(g).map((n) => n.path)).toEqual(['hub.ts'])
+  })
+
+  it('applies the limit and tolerates a null graph', () => {
+    const g = graph({ nodes: [ranked('a.ts', 1, 1), ranked('b.ts', 2, 0.5)] })
+    expect(rankedFiles(g, 1).map((n) => n.path)).toEqual(['a.ts'])
+    expect(rankedFiles(null)).toEqual([])
+  })
+
+  it('does not mutate the caller\'s node array', () => {
+    // `Array.prototype.sort` is in-place; sorting `graph.nodes` directly would
+    // reorder the store's own graph as a side effect of rendering a sidebar.
+    const g = graph({ nodes: [ranked('c.ts', 3, 0.2), ranked('a.ts', 1, 1)] })
+    rankedFiles(g)
+    expect(g.nodes.map((n) => n.path)).toEqual(['c.ts', 'a.ts'])
+  })
+})
+
+describe('setMinRank', () => {
+  it('clamps to [0, 1] so the canvas can never be blanked by a bad value', () => {
+    const { setMinRank } = useGraphStore.getState()
+    setMinRank(0.4)
+    expect(useGraphStore.getState().minRank).toBe(0.4)
+    setMinRank(-1)
+    expect(useGraphStore.getState().minRank).toBe(0)
+    setMinRank(7)
+    expect(useGraphStore.getState().minRank).toBe(1)
+    setMinRank(0)
+  })
+})
 
 describe('agentActivityTargets', () => {
   it('uses the path directly when one is given', () => {

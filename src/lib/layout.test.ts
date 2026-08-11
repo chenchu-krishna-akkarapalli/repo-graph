@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest'
 import type { RepoGraph } from '../types'
-import { buildFlow, dirOf, KNOWN_LANGUAGES, normalizeLanguage, type FolderNodeData } from './layout'
+import {
+  buildFlow,
+  dirOf,
+  KNOWN_LANGUAGES,
+  NODE_WIDTH,
+  normalizeLanguage,
+  rankedWidth,
+  type FileNodeData,
+  type FolderNodeData,
+} from './layout'
 
 const ALL_LANGUAGES: ReadonlySet<string> = new Set(KNOWN_LANGUAGES)
 
@@ -113,6 +122,74 @@ describe('buildFlow', () => {
 
     const both = buildFlow(g, ALL_LANGUAGES, new Set(), new Set(['a.ts', 'b.ts']))
     expect(both.edges.some((e) => e.data?.isSymbolEdge)).toBe(true)
+  })
+})
+
+describe('rank rendering', () => {
+  function ranked(path: string, rank_score: number, rank_order: number) {
+    return { ...node(path), rank_score, rank_order }
+  }
+
+  it('scales node width with rank and keeps it inside the column gap', () => {
+    const g = graph({ nodes: [ranked('hub.ts', 1, 1), ranked('leaf.ts', 0.1, 2)] })
+    const { nodes } = buildFlow(g, ALL_LANGUAGES, new Set(), new Set())
+    const hub = nodes.find((n) => n.id === 'hub.ts')!
+    const leaf = nodes.find((n) => n.id === 'leaf.ts')!
+    expect(hub.style?.width).toBeGreaterThan(leaf.style?.width as number)
+    // Columns are 340px apart; a wider node than that would collide.
+    expect(hub.style?.width as number).toBeLessThan(340)
+  })
+
+  it('renders an unranked graph at the base width instead of collapsing it', () => {
+    // A `.repograph/graph.json` written before ranking existed has no
+    // rank fields at all; it must still lay out normally.
+    const g = graph({ nodes: [node('a.ts')] })
+    const { nodes } = buildFlow(g, ALL_LANGUAGES, new Set(), new Set())
+    expect(nodes).toHaveLength(1)
+    expect(nodes[0].style?.width).toBe(NODE_WIDTH)
+    expect((nodes[0].data as FileNodeData).rankOrder).toBe(0)
+  })
+
+  it('clamps out-of-range ranks rather than producing an absurd width', () => {
+    expect(rankedWidth(0)).toBe(NODE_WIDTH)
+    expect(rankedWidth(-5)).toBe(NODE_WIDTH)
+    expect(rankedWidth(99)).toBe(rankedWidth(1))
+  })
+
+  it('hides nodes below minRank', () => {
+    const g = graph({ nodes: [ranked('hub.ts', 1, 1), ranked('leaf.ts', 0.1, 2)] })
+    const { nodes } = buildFlow(g, ALL_LANGUAGES, new Set(), new Set(), 0.5)
+    expect(nodes.map((n) => n.id)).toEqual(['hub.ts'])
+  })
+
+  it('leaves an unranked graph untouched at the default minRank', () => {
+    // The regression that would matter most: defaulting to a filter that
+    // treats "no rank" as "rank 0" and blanks the canvas for old caches.
+    const g = graph({ nodes: [node('a.ts'), node('b.ts')] })
+    expect(buildFlow(g, ALL_LANGUAGES, new Set(), new Set()).nodes).toHaveLength(2)
+  })
+
+  it('counts dependents excluding route markers, matching the manifest', () => {
+    const g = graph({
+      nodes: [node('db.ts'), node('a.ts'), node('b.ts')],
+      edges: [
+        { from_path: 'a.ts', to_path: 'db.ts', kind: 'imports' as const },
+        { from_path: 'b.ts', to_path: 'db.ts', kind: 'imports' as const },
+        { from_path: 'a.ts', to_path: 'db.ts', kind: 'route' as const },
+      ],
+    })
+    const { nodes } = buildFlow(g, ALL_LANGUAGES, new Set(), new Set())
+    const db = nodes.find((n) => n.id === 'db.ts')!
+    expect((db.data as FileNodeData).dependents).toBe(2)
+  })
+
+  it('sizes expanded symbol children to the parent rank-scaled width', () => {
+    const symbols = [{ name: 'go', kind: 'function', start_line: 1, end_line: 2 }]
+    const g = graph({ nodes: [{ ...node('a.ts', 'javascript', symbols), rank_score: 1, rank_order: 1 }] })
+    const { nodes } = buildFlow(g, ALL_LANGUAGES, new Set(), new Set(['a.ts']))
+    const parent = nodes.find((n) => n.id === 'a.ts')!
+    const child = nodes.find((n) => n.id === 'a.ts#go')!
+    expect(child.style?.width).toBe((parent.style?.width as number) - 20)
   })
 })
 

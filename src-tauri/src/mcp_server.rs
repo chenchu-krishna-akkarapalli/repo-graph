@@ -10,7 +10,9 @@
 //! - credential-bearing files are refused even when present in the index
 
 use crate::graph::{Adjacency, Graph, GraphLoadError, GRAPH_CACHE_RELATIVE_PATH};
-use crate::manifest::{build_manifest_with, render_markdown, DEFAULT_LINE_BUDGET};
+use crate::manifest::{
+    build_manifest_with, render_markdown, ManifestOptions, SortBy, DEFAULT_LINE_BUDGET,
+};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -54,9 +56,8 @@ fn sanitize_windows_path(raw: &str) -> PathBuf {
     if cleaned.starts_with("//?/") || cleaned.starts_with("\\\\?\\") {
         cleaned = &cleaned[4..];
     } else if cleaned.starts_with("//?") || cleaned.starts_with("\\\\?") {
-        if cleaned.len() >= 3 {
-            cleaned = &cleaned[3..];
-        }
+        // `starts_with` on a 3-byte ASCII prefix already guarantees the length.
+        cleaned = &cleaned[3..];
     }
     PathBuf::from(cleaned.replace('/', std::path::MAIN_SEPARATOR_STR))
 }
@@ -357,8 +358,23 @@ impl McpServer {
 
         let outcome = match name {
             "repograph_files" => {
-                let scope = args.get("scope").and_then(Value::as_str);
-                self.get_manifest(scope)
+                let options = ManifestOptions {
+                    scope: args.get("scope").and_then(Value::as_str),
+                    // `as_u64` rejects a float or a negative, which is the
+                    // behaviour we want — a bad `top_k` should be ignored, not
+                    // silently rounded into a different query.
+                    top_k: args
+                        .get("top_k")
+                        .and_then(Value::as_u64)
+                        .map(|k| k as usize),
+                    min_rank: args.get("min_rank").and_then(Value::as_f64),
+                    sort_by: args
+                        .get("sort_by")
+                        .and_then(Value::as_str)
+                        .map(SortBy::parse)
+                        .unwrap_or_default(),
+                };
+                self.get_manifest_with(&options)
             }
             "repograph_node" => {
                 let path = args.get("path").and_then(Value::as_str).ok_or((-32602, "repograph_node requires 'path'".to_string()))?;
@@ -433,15 +449,36 @@ impl McpServer {
     // ----- tools -----------------------------------------------------------
 
     pub fn get_manifest(&mut self, scope: Option<&str>) -> Result<String, ToolError> {
+        self.get_manifest_with(&ManifestOptions::scoped(scope))
+    }
+
+    pub fn get_manifest_with(
+        &mut self,
+        options: &ManifestOptions<'_>,
+    ) -> Result<String, ToolError> {
         let root_display = self.root_display.clone();
         let (graph, adjacency) = self.graph_and_adjacency()?;
-        let manifest = build_manifest_with(graph, adjacency, &root_display, scope);
+        let manifest = build_manifest_with(graph, adjacency, &root_display, options);
         if manifest.files.is_empty() {
-            if let Some(s) = scope {
+            if let Some(s) = options.scope {
                 return Err(ToolError::new(
                     "empty_scope",
                     format!("no indexed files match scope '{s}'"),
                 ));
+            }
+            // An over-strict `min_rank` returns nothing from a healthy graph,
+            // which is indistinguishable from "the repo is empty" unless we
+            // say so.
+            if let Some(min) = options.min_rank {
+                if manifest.total_files > 0 {
+                    return Err(ToolError::new(
+                        "empty_rank_filter",
+                        format!(
+                            "no files scored at or above min_rank {min}; \
+                             ranks are normalized so the top file is 1.0"
+                        ),
+                    ));
+                }
             }
         }
         let mut md = render_markdown(&manifest, DEFAULT_LINE_BUDGET);
@@ -1145,13 +1182,29 @@ fn tools_list_result() -> Value {
     if allowed.contains(&"files".to_string()) {
         tools.push(json!({
             "name": "repograph_files",
-            "description": "Compressed project architecture map (one line per file: exports, routes, dependencies). Check this before requesting full file reads. Optionally scoped to a path prefix.",
+            "description": "Compressed project architecture map (one line per file: rank, exports, routes, dependency counts). Ordered by dependency-graph centrality, most important first. Check this before requesting full file reads. Use top_k to read only the core of a large repo.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "scope": {
                         "type": "string",
                         "description": "Optional path prefix to scope the manifest, e.g. 'src/api/**'"
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Return only the K highest-ranked files. Start here on an unfamiliar repo: top_k 20-30 usually covers the architectural core."
+                    },
+                    "min_rank": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1,
+                        "description": "Drop files scoring below this centrality. Scores are normalized so the most central file is 1.0; 0.1 is a reasonable 'core only' cut."
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "enum": ["rank", "alphabetical", "depth"],
+                        "description": "Presentation order only (default 'rank'). top_k and min_rank always select by rank."
                     }
                 }
             }
@@ -1397,7 +1450,7 @@ mod tests {
 
     #[test]
     fn manifest_schema_version_is_semver_and_separate_from_the_cache_id() {
-        assert_eq!(crate::manifest::MANIFEST_SCHEMA_VERSION, "1.1.0");
+        assert_eq!(crate::manifest::MANIFEST_SCHEMA_VERSION, "1.2.0");
         // The on-disk cache layout is unchanged; conflating the two would
         // invalidate every existing `.repograph/graph.json`.
         let graph: crate::graph::Graph =
@@ -1566,14 +1619,44 @@ mod tests {
         let (_g, mut server) = temp_repo();
         let md = server.get_manifest(None).unwrap();
         assert!(md.starts_with("## Project Architecture Map"));
-        assert!(md.contains(
-            "- /src/components/Button.tsx (Exports: Button) (Depends on: /src/hooks/useTheme.ts)"
-        ));
+        assert!(
+            md.contains(
+                "/src/components/Button.tsx (Exports: Button) (Depends on: /src/hooks/useTheme.ts)"
+            ),
+            "{md}"
+        );
         let scoped = server.get_manifest(Some("src/hooks/**")).unwrap();
-        assert!(scoped.contains("- /src/hooks/useTheme.ts"));
+        assert!(scoped.contains("/src/hooks/useTheme.ts"));
         assert!(!scoped.contains("Button.tsx"));
         let err = server.get_manifest(Some("nope/**")).unwrap_err();
         assert_eq!(err.code, "empty_scope");
+    }
+
+    /// The ranking filters have to be reachable through the JSON-RPC surface,
+    /// not just the Rust API — that is the only path an agent has.
+    #[test]
+    fn repograph_files_accepts_ranking_filters_over_the_wire() {
+        let (_g, mut server) = temp_repo();
+        let opts = ManifestOptions {
+            top_k: Some(1),
+            ..Default::default()
+        };
+        let md = server.get_manifest_with(&opts).unwrap();
+        assert_eq!(md.matches("\n- /").count(), 1, "top_k=1 kept extra files:\n{md}");
+        assert!(
+            md.contains("Showing 1 of 2 files"),
+            "truncation must be announced:\n{md}"
+        );
+
+        // A threshold nothing can satisfy is a distinct, explained failure —
+        // not an empty map the agent would read as an empty repo.
+        let err = server
+            .get_manifest_with(&ManifestOptions {
+                min_rank: Some(1.5),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert_eq!(err.code, "empty_rank_filter");
     }
 
     #[test]

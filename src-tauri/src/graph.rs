@@ -20,7 +20,7 @@ pub struct Graph {
     pub symbol_edges: Vec<crate::db::SymbolEdge>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Node {
     pub path: String,
     #[serde(default)]
@@ -37,6 +37,17 @@ pub struct Node {
     pub out_degree: u32,
     #[serde(default)]
     pub symbols: Vec<crate::parsers::ExtractedSymbol>,
+    /// Normalized graph centrality in `(0, 1]`, `1.0` for the most central
+    /// file. Computed by [`crate::rank::compute_ranks`], never hand-set.
+    ///
+    /// `#[serde(default)]` so a `.repograph/graph.json` written before ranking
+    /// existed still deserializes — every load path recomputes, so a stale
+    /// cache is refreshed rather than reported as rank 0.
+    #[serde(default)]
+    pub rank_score: f64,
+    /// Dense 1-based position in the ranking. `0` only before ranking has run.
+    #[serde(default)]
+    pub rank_order: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +247,8 @@ pub fn build_graph(parsed: Vec<ParsedFile>, aliases: &HashMap<String, Vec<String
             in_degree: 0,
             out_degree: 0,
             symbols: p.extraction.symbols.clone(),
+            rank_score: 0.0,
+            rank_order: 0,
         });
     }
 
@@ -250,7 +263,10 @@ pub fn build_graph(parsed: Vec<ParsedFile>, aliases: &HashMap<String, Vec<String
         node.in_degree = in_counts.get(node.path.as_str()).copied().unwrap_or(0);
     }
 
-    Graph {
+    let mut graph = Graph {
+        // Unchanged: `rank_score`/`rank_order` are additive and defaulted, so
+        // every existing cache still deserializes. Bumping this would break
+        // them for a field that is recomputed on load anyway.
         schema_version: 1,
         nodes,
         edges: edges
@@ -264,7 +280,9 @@ pub fn build_graph(parsed: Vec<ParsedFile>, aliases: &HashMap<String, Vec<String
         external_dependencies: externals.into_iter().collect(),
         warnings,
         symbol_edges: Vec::new(),
-    }
+    };
+    crate::rank::compute_ranks(&mut graph);
+    graph
 }
 
 pub(crate) fn resolve_candidates(language: &str, stem: &str) -> Vec<String> {
@@ -402,7 +420,21 @@ impl Graph {
         let raw = std::fs::read_to_string(cache_path).map_err(GraphLoadError::Io)?;
         // Tolerate a UTF-8 BOM — common when the cache was written by
         // Windows tooling.
-        serde_json::from_str(raw.trim_start_matches('\u{feff}')).map_err(GraphLoadError::Malformed)
+        let mut graph: Graph = serde_json::from_str(raw.trim_start_matches('\u{feff}'))
+            .map_err(GraphLoadError::Malformed)?;
+        // Recompute rather than trust the cache: a graph.json written before
+        // ranking existed carries the serde defaults, and reporting every file
+        // at rank 0 is worse than the cost of one power iteration.
+        crate::rank::compute_ranks(&mut graph);
+        Ok(graph)
+    }
+
+    /// Node paths in descending rank order — the manifest's presentation order
+    /// and the basis for `top_k`.
+    pub fn ranked_paths(&self) -> Vec<&str> {
+        let mut nodes: Vec<&Node> = self.nodes.iter().collect();
+        nodes.sort_by_key(|n| n.rank_order);
+        nodes.into_iter().map(|n| n.path.as_str()).collect()
     }
 
     pub fn node(&self, path: &str) -> Option<&Node> {

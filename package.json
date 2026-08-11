@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "tauri": "tauri",
-    "build": "tsc -b && vite build",
+    "build": "cargo build --manifest-path src-tauri/Cargo.toml --release --bin mcp_server && tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
     "test": "vitest run",

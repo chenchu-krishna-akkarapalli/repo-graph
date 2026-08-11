@@ -20,6 +20,14 @@ import EdgeHighlight from './nodes/EdgeHighlight'
 const nodeTypes = { file: CustomFileNode, folder: CustomFolderNode, symbol: CustomSymbolNode }
 const edgeTypes = { highlight: EdgeHighlight }
 
+/** Node widths vary with rank, so centering has to read the laid-out width
+ *  rather than assume the base one. */
+function centerOf(node: Node): { x: number; y: number } {
+  const width = typeof node.style?.width === 'number' ? node.style.width : NODE_WIDTH
+  const height = typeof node.style?.height === 'number' ? node.style.height : NODE_HEIGHT
+  return { x: node.position.x + width / 2, y: node.position.y + height / 2 }
+}
+
 /** Above this size, layout runs off the paint frame behind a progress overlay. */
 const PROGRESSIVE_LOAD_THRESHOLD = 500
 const EMPTY_FLOW: { nodes: Node[]; edges: Edge[] } = { nodes: [], edges: [] }
@@ -29,6 +37,7 @@ function Canvas() {
   const languageFilters = useGraphStore((s) => s.languageFilters)
   const collapsedDirs = useGraphStore((s) => s.collapsedDirs)
   const expandedFiles = useGraphStore((s) => s.expandedFiles)
+  const minRank = useGraphStore((s) => s.minRank)
   const select = useGraphStore((s) => s.select)
   const clearSelection = useGraphStore((s) => s.clearSelection)
   const setHovered = useGraphStore((s) => s.setHovered)
@@ -57,7 +66,7 @@ function Canvas() {
       setIngestingCount(0)
       return
     }
-    const build = () => buildFlow(graph, languageFilters, collapsedDirs, expandedFiles)
+    const build = () => buildFlow(graph, languageFilters, collapsedDirs, expandedFiles, minRank)
     if (graph.nodes.length <= PROGRESSIVE_LOAD_THRESHOLD) {
       // Layout is deliberately state, not a `useMemo`: past the threshold
       // it is deferred a macrotask so the overlay can paint first.
@@ -73,7 +82,7 @@ function Canvas() {
       setIngestingCount(0)
     }, 32)
     return () => clearTimeout(timer)
-  }, [graph, languageFilters, collapsedDirs, expandedFiles])
+  }, [graph, languageFilters, collapsedDirs, expandedFiles, minRank])
 
   useEffect(() => {
     if (!graph || nodes.length === 0 || fittedGraphRef.current === graph) return
@@ -95,10 +104,8 @@ function Canvas() {
     (_event, node: Node) => {
       if (node.type !== 'file') return
       select(node.id, false)
-      setCenter(node.position.x + NODE_WIDTH / 2, node.position.y + NODE_HEIGHT / 2, {
-        zoom: Math.max(getZoom(), 1.1),
-        duration: 200,
-      })
+      const { x, y } = centerOf(node)
+      setCenter(x, y, { zoom: Math.max(getZoom(), 1.1), duration: 200 })
     },
     [select, setCenter, getZoom],
   )
@@ -125,10 +132,8 @@ function Canvas() {
     if (!focusRequest) return
     const node = nodes.find((n) => n.id === focusRequest.path)
     if (!node) return
-    setCenter(node.position.x + NODE_WIDTH / 2, node.position.y + NODE_HEIGHT / 2, {
-      zoom: Math.max(getZoom(), 1.1),
-      duration: 200,
-    })
+    const { x, y } = centerOf(node)
+    setCenter(x, y, { zoom: Math.max(getZoom(), 1.1), duration: 200 })
   }, [focusRequest, nodes, setCenter, getZoom])
 
   // Esc deselects everywhere, even when the canvas isn't focused.

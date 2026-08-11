@@ -9,6 +9,24 @@ export const NODE_HEIGHT = 48
 const COLUMN_GAP = 340
 const ROW_GAP = 96
 
+/**
+ * How much a top-ranked node widens over an unranked one.
+ *
+ * Width rather than height: height is load-bearing here — an expanded node's
+ * height is `48 + symbols × 44` and its symbol children are positioned against
+ * those exact offsets, so scaling it would misalign them. Width is free.
+ *
+ * The cap keeps the widest node (176 × 1.35 ≈ 238px) inside `COLUMN_GAP`, so
+ * columns can never collide however the ranks fall.
+ */
+const RANK_WIDTH_GAIN = 0.35
+
+/** Node width for a given normalized rank. Exported for the centering math. */
+export function rankedWidth(rank: number): number {
+  const clamped = Math.max(0, Math.min(1, rank))
+  return Math.round(NODE_WIDTH * (1 + RANK_WIDTH_GAIN * clamped))
+}
+
 export interface FileNodeData {
   path: string
   name: string
@@ -21,6 +39,14 @@ export interface FileNodeData {
   /** `|a|b|` adjacency string consumed by the CSS hover rules (see
    *  `hoverHighlight.ts`) — computed once per layout, never per mouse move. */
   neighbors: string
+  /** Normalized graph centrality in [0, 1]. `0` when the backend predates
+   *  ranking, which reads as "unranked" and renders at the base width. */
+  rank: number
+  /** Dense 1-based repo-wide rank; `0` when unranked. */
+  rankOrder: number
+  /** In-repo files depending on this one. Route edges excluded, matching the
+   *  manifest's `(In: k)` — the same number should not mean two things. */
+  dependents: number
 }
 
 export interface FolderNodeData {
@@ -49,15 +75,27 @@ export function buildFlow(
   languageFilters: ReadonlySet<string>,
   collapsedDirs: ReadonlySet<string>,
   expandedFiles: ReadonlySet<string>,
+  minRank = 0,
 ): { nodes: Node<FlowNodeData>[]; edges: Edge[] } {
-  const visible = graph.nodes.filter((n) => languageFilters.has(normalizeLanguage(n.language)))
+  const visible = graph.nodes.filter(
+    (n) =>
+      languageFilters.has(normalizeLanguage(n.language)) &&
+      // `?? 0` means an unranked graph (a cache written before ranking, or a
+      // test fixture) is unaffected at the default `minRank` of 0 rather than
+      // rendering as an empty canvas.
+      (n.rank_score ?? 0) >= minRank,
+  )
 
   // Adjacency baked into the node payload so hover highlighting is a pure
   // CSS attribute match instead of a per-node store lookup.
   const neighborSets = new Map<string, Set<string>>()
+  const dependentCounts = new Map<string, number>()
   for (const e of graph.edges) {
     addNeighbor(neighborSets, e.from_path, e.to_path)
     addNeighbor(neighborSets, e.to_path, e.from_path)
+    if (e.kind !== 'route') {
+      dependentCounts.set(e.to_path, (dependentCounts.get(e.to_path) ?? 0) + 1)
+    }
   }
 
   /** File path → its representative id (own path, or collapsed folder id). */
@@ -90,6 +128,8 @@ export function buildFlow(
     const y = currentYMap.get(depth) ?? 0
     currentYMap.set(depth, y + nodeHeight + ROW_GAP)
     const neighbors = neighborAttr(neighborSets.get(n.path) ?? [])
+    const rank = n.rank_score ?? 0
+    const nodeWidth = rankedWidth(rank)
 
     nodes.push({
       id: n.path,
@@ -105,8 +145,11 @@ export function buildFlow(
         isExpanded,
         symbols: n.symbols,
         neighbors,
+        rank,
+        rankOrder: n.rank_order ?? 0,
+        dependents: dependentCounts.get(n.path) ?? 0,
       },
-      style: { width: NODE_WIDTH, height: nodeHeight },
+      style: { width: nodeWidth, height: nodeHeight },
     })
 
     if (isExpanded) {
@@ -117,7 +160,8 @@ export function buildFlow(
           parentNode: n.path,
           extent: 'parent',
           position: { x: 10, y: 48 + index * 44 },
-          style: { width: 156, height: 34 },
+          // Tracks the parent's rank-scaled width so children never overflow.
+          style: { width: nodeWidth - 20, height: 34 },
           // Symbols inherit the parent file's identity so they dim/light
           // together with it under the same CSS rule.
           data: { name: sym.name, kind: sym.kind, parentFile: n.path, neighbors },
