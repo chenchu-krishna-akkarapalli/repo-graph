@@ -20,7 +20,7 @@ fn find_repo_root() -> Option<PathBuf> {
     }
     let mut dir = std::env::current_dir().ok()?;
     loop {
-        if dir.join(".repograph/graph.db").is_file() {
+        if dir.join(".repograph/graph.db").is_file() || dir.join(".repograph/graph.json").is_file() {
             return Some(dir);
         }
         if !dir.pop() {
@@ -305,14 +305,23 @@ fn get_mcp_config_snippet(project_root: String, app_handle: tauri::AppHandle) ->
 #[tauri::command]
 fn read_graph(app_handle: tauri::AppHandle) -> Result<Graph, String> {
     let root = find_repo_root().ok_or_else(|| {
-        "no .repograph/graph.db found — run: mcp_server index <repo_root>".to_string()
+        "no .repograph/graph.db or .repograph/graph.json found — run: mcp_server index <repo_root>".to_string()
     })?;
     write_active_project_registry(&root);
     repo_graph::watcher::start_watcher(app_handle, root.clone());
     
     let db_path = root.join(".repograph/graph.db");
-    let conn = repo_graph::db::init_db(&db_path).map_err(|e| e.to_string())?;
-    let graph = repo_graph::db::load_graph_from_db(&conn).map_err(|e| e.to_string())?;
+    let graph = match repo_graph::db::init_db(&db_path).and_then(|conn| repo_graph::db::load_graph_from_db(&conn)) {
+        Ok(g) => g,
+        Err(db_err) => {
+            let json_path = root.join(".repograph/graph.json");
+            if json_path.is_file() {
+                Graph::load_from_cache(&json_path).map_err(|e| format!("db error ({db_err}) and cache error ({e})"))?
+            } else {
+                return Err(db_err.to_string());
+            }
+        }
+    };
 
     let symbol_count = graph.nodes.iter().map(|n| n.symbols.len()).sum::<usize>() as i64;
     let mut lang_counts = std::collections::HashMap::new();

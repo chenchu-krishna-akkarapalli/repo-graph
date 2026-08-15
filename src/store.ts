@@ -5,6 +5,7 @@ import { loadGraph, tauriInvoke } from './lib/loadGraph'
 import { buildTreeFromPaths } from './lib/fileTree'
 import { applyHoverHighlight } from './lib/hoverHighlight'
 import { KNOWN_LANGUAGES } from './lib/layout'
+import { savePersistedGraph, loadPersistedGraph } from './lib/graphCache'
 
 export type SidebarTab = 'overview' | 'dependencies' | 'impact' | 'callgraph'
 
@@ -257,6 +258,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
           // built above is a fine fallback, so this is not worth surfacing.
         }
       }
+      savePersistedGraph(root, graph)
       set({
         ...ingestGraph(graph),
         status: 'synced',
@@ -273,8 +275,27 @@ export const useGraphStore = create<GraphState>((set, get) => ({
         selectedSymbol: null,
       })
     } catch (e) {
-      fuse = null
-      set({ status: 'stale', loadError: e instanceof Error ? e.message : String(e) })
+      // Auto-Rehydration Layer: If memory graph is missing or load failed,
+      // attempt recovery from local persistent cache without crashing.
+      const persisted = loadPersistedGraph(get().activeProjectRoot)
+      if (persisted && persisted.graph && persisted.graph.nodes.length > 0) {
+        console.info('[store] Auto-rehydrated graph from persistent cache.')
+        set({
+          ...ingestGraph(persisted.graph),
+          status: 'synced',
+          loadError: null,
+          activeProjectRoot: get().activeProjectRoot || persisted.root,
+          fileTree: buildTreeFromPaths(persisted.graph.nodes.map((n) => n.path)),
+          collapsedDirs:
+            get().collapsedDirs.size > 0 ? get().collapsedDirs : autoCollapsedDirs(persisted.graph),
+        })
+      } else if (!get().graph) {
+        fuse = null
+        set({ status: 'stale', loadError: e instanceof Error ? e.message : String(e) })
+      } else {
+        // Cache Eviction Guard: keep existing graph in memory
+        set({ status: 'stale', loadError: e instanceof Error ? e.message : String(e) })
+      }
     }
   },
 
@@ -289,6 +310,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       const started = performance.now()
       const graph = (await invoke('index_and_load_graph', { root })) as RepoGraph
       const fileTree = (await invoke('read_directory_tree', { root })) as FileTreeNode[]
+      savePersistedGraph(root, graph)
       set({
         ...ingestGraph(graph),
         status: 'synced',
@@ -328,6 +350,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       const started = performance.now()
       const graph = (await invoke('index_and_load_graph', { root })) as RepoGraph
       const fileTree = (await invoke('read_directory_tree', { root })) as FileTreeNode[]
+      savePersistedGraph(root, graph)
       set({
         ...ingestGraph(graph),
         status: 'synced',

@@ -27,6 +27,12 @@ Desktop, Claude Code, or any other MCP-compatible agent can call.
 - Resolves a URL/route string to the file(s) implementing it (web
   frameworks only — Next.js App Router, FastAPI, Flask).
 
+## Persistent Session & Connection Management
+
+- **Resident Session**: The MCP server maintains active session state across all multi-turn agent conversations without dropping connection context.
+- **Keepalive / Heartbeat**: The JSON-RPC `ping` method records heartbeats and returns health metrics (`connected: true`, `session_active: true`, `session_id`, `uptime_ms`).
+- **Connection Health Tool (`repograph_status`)**: Exposes connection state (`connected: true`, `session_active: true`), session uptime, heartbeats, tool queries, and pending sync files.
+
 ## Caching / staleness
 
 - Graph is built once on first `get_manifest()` call per session and cached

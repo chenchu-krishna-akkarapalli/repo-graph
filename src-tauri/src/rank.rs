@@ -63,10 +63,12 @@ pub const CONVERGENCE_L1: f64 = 1e-10;
 const SCORE_DECIMALS: u32 = 6;
 
 const TELEPORT_BASE: f64 = 1.0;
-/// Multiplier on a route handler's prior importance.
+/// Multiplier on a route handler or application entry point's prior importance.
 const ENTRY_POINT_BOOST: f64 = 3.0;
 /// Multiplier on a barrel file's prior importance (see module docs).
 const BARREL_TELEPORT: f64 = 0.25;
+/// Multiplier on a test file's prior importance to prevent tests from cluttering top ranks.
+const TEST_FILE_TELEPORT: f64 = 0.25;
 
 /// Relative trust in each edge kind as evidence of the target's importance.
 pub fn edge_weight(kind: EdgeKind) -> f64 {
@@ -79,6 +81,45 @@ pub fn edge_weight(kind: EdgeKind) -> f64 {
         // Entry-point marker, not a dependency.
         EdgeKind::Route => 0.0,
     }
+}
+
+/// Detect test files so their prior doesn't pollute the top of the manifest.
+pub fn is_test_file(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    let name = normalized.rsplit('/').next().unwrap_or(&normalized);
+    name.contains(".test.")
+        || name.contains(".spec.")
+        || name.ends_with("_test.go")
+        || name.ends_with("_test.py")
+        || name.ends_with("_test.rs")
+        || normalized.starts_with("tests/")
+        || normalized.contains("/tests/")
+        || normalized.starts_with("__tests__/")
+        || normalized.contains("/__tests__/")
+}
+
+/// Detect app / binary root entry points that initiate application execution.
+pub fn is_root_entry_point(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    matches!(
+        normalized.as_str(),
+        "src/App.tsx"
+            | "src/App.jsx"
+            | "src/main.tsx"
+            | "src/main.jsx"
+            | "src/main.ts"
+            | "src/main.js"
+            | "src/index.tsx"
+            | "src/index.jsx"
+            | "src/main.rs"
+            | "src-tauri/src/main.rs"
+            | "src-tauri/src/bin/mcp_server.rs"
+            | "app/page.tsx"
+            | "app/layout.tsx"
+            | "pages/index.tsx"
+            | "pages/_app.tsx"
+    ) || normalized.starts_with("src/bin/")
+        || normalized.starts_with("src-tauri/src/bin/")
 }
 
 /// A file whose whole job is re-exporting other files.
@@ -102,11 +143,14 @@ pub fn is_barrel(node: &Node, out_degree: u32) -> bool {
 /// Prior importance of a node, before any link evidence.
 fn teleport_weight(node: &Node, out_degree: u32) -> f64 {
     let mut w = TELEPORT_BASE;
-    if !node.routes.is_empty() {
+    if !node.routes.is_empty() || is_root_entry_point(&node.path) {
         w *= ENTRY_POINT_BOOST;
     }
     if is_barrel(node, out_degree) {
         w *= BARREL_TELEPORT;
+    }
+    if is_test_file(&node.path) {
+        w *= TEST_FILE_TELEPORT;
     }
     w
 }
@@ -619,5 +663,34 @@ mod tests {
             serde_json::from_str(r#"{"schema_version":1,"nodes":[],"edges":[]}"#).unwrap();
         compute_ranks(&mut g);
         assert!(g.nodes.is_empty());
+    }
+
+    #[test]
+    fn test_file_prior_is_dampened_below_production_code() {
+        let g = graph_from(
+            r#"{"schema_version":1,
+                "nodes":[
+                  {"path":"src/utils.ts"},
+                  {"path":"src/utils.test.ts"}
+                ],
+                "edges":[]}"#,
+        );
+        assert!(score(&g, "src/utils.ts") > score(&g, "src/utils.test.ts"));
+        assert_eq!(order(&g, "src/utils.ts"), 1);
+        assert_eq!(order(&g, "src/utils.test.ts"), 2);
+    }
+
+    #[test]
+    fn root_entry_points_receive_teleport_boost() {
+        let g = graph_from(
+            r#"{"schema_version":1,
+                "nodes":[
+                  {"path":"src/App.tsx"},
+                  {"path":"src/components/Widget.tsx"}
+                ],
+                "edges":[]}"#,
+        );
+        assert!(score(&g, "src/App.tsx") > score(&g, "src/components/Widget.tsx"));
+        assert_eq!(order(&g, "src/App.tsx"), 1);
     }
 }

@@ -378,14 +378,16 @@ pub(crate) fn external_package_name(language: &str, raw: &str) -> String {
 }
 
 impl Graph {
-    /// Serialize to `<root>/.repograph/graph.json` for the MCP server.
+    /// Serialize to `<root>/.repograph/graph.json` for the MCP server atomically.
     pub fn save_to_cache(&self, root: &Path) -> std::io::Result<std::path::PathBuf> {
         let cache_path = root.join(GRAPH_CACHE_RELATIVE_PATH);
         if let Some(dir) = cache_path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         let json = serde_json::to_string_pretty(self).expect("graph serializes");
-        std::fs::write(&cache_path, json)?;
+        let tmp_path = cache_path.with_extension("json.tmp");
+        std::fs::write(&tmp_path, json)?;
+        std::fs::rename(&tmp_path, &cache_path)?;
         Ok(cache_path)
     }
 }

@@ -18,6 +18,35 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct McpSession {
+    pub session_id: String,
+    pub start_time: i64,
+    pub last_heartbeat: i64,
+    pub last_active: i64,
+    pub heartbeat_count: u64,
+    pub queries_count: u64,
+    pub connected: bool,
+    pub session_active: bool,
+}
+
+impl Default for McpSession {
+    fn default() -> Self {
+        let now = chrono::Utc::now().timestamp_millis();
+        let session_id = format!("sess_{:x}_{:x}", std::process::id(), now);
+        McpSession {
+            session_id,
+            start_time: now,
+            last_heartbeat: now,
+            last_active: now,
+            heartbeat_count: 0,
+            queries_count: 0,
+            connected: true,
+            session_active: true,
+        }
+    }
+}
+
 pub struct McpServer {
     /// Canonicalized repo root; the confinement boundary for all file access.
     root: PathBuf,
@@ -34,6 +63,8 @@ pub struct McpServer {
     /// `PRAGMA table_info` probe, and this used to be re-run per logged query
     /// and once more per explored symbol.
     conn: Option<rusqlite::Connection>,
+    /// Persistent connection and session state across turns.
+    pub session: McpSession,
 }
 
 #[derive(Debug, PartialEq)]
@@ -80,10 +111,11 @@ fn resolve_mcp_root(root: &Path) -> Result<(PathBuf, String, Option<String>), St
                     .map(sanitize_windows_path)
             })
             .filter(|p| {
-                let ok = p.join(".repograph").is_dir();
+                let ok = p.join(".repograph").is_dir()
+                    && (p.join(".repograph/graph.db").is_file() || p.join(".repograph/graph.json").is_file());
                 if !ok {
                     eprintln!(
-                        "[mcp] ignoring registry root {} — no .repograph directory",
+                        "[mcp] ignoring registry root {} — no valid .repograph index found",
                         p.display()
                     );
                 }
@@ -262,6 +294,7 @@ impl McpServer {
             graph_mtime: None,
             sync_warning,
             conn: None,
+            session: McpSession::default(),
         })
     }
 
@@ -269,6 +302,9 @@ impl McpServer {
     fn db(&mut self) -> Result<&rusqlite::Connection, ToolError> {
         if self.conn.is_none() {
             let db_path = self.root.join(".repograph/graph.db");
+            if let Some(parent) = db_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             let conn = crate::db::init_db(&db_path)
                 .map_err(|e| ToolError::new("db_error", format!("failed to open database: {e}")))?;
             self.conn = Some(conn);
@@ -276,26 +312,53 @@ impl McpServer {
         Ok(self.conn.as_ref().expect("opened above"))
     }
 
-    /// Blocking serve loop over stdin/stdout. Returns when stdin closes.
+    /// Blocking serve loop over stdin/stdout with persistent connection error recovery.
     pub fn serve_stdio(&mut self) -> std::io::Result<()> {
         let stdin = std::io::stdin();
         let mut stdout = std::io::stdout();
-        for line in stdin.lock().lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Some(response) = self.handle_message(&line) {
-                stdout.write_all(response.to_string().as_bytes())?;
-                stdout.write_all(b"\n")?;
-                stdout.flush()?;
+        let mut reader = stdin.lock();
+        let mut line_buf = String::new();
+        loop {
+            line_buf.clear();
+            match reader.read_line(&mut line_buf) {
+                Ok(0) => break, // EOF reached
+                Ok(_) => {
+                    let trimmed = line_buf.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if let Some(response) = self.handle_message(trimmed) {
+                        let bytes = response.to_string();
+                        if let Err(e) = stdout
+                            .write_all(bytes.as_bytes())
+                            .and_then(|_| stdout.write_all(b"\n"))
+                            .and_then(|_| stdout.flush())
+                        {
+                            eprintln!("[mcp_server] stdout error: {e}");
+                            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[mcp_server] stdin read error: {e}");
+                    if e.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break;
+                }
             }
         }
+        self.session.connected = false;
+        self.session.session_active = false;
         Ok(())
     }
 
     /// Handle one raw JSON-RPC message; `None` for notifications (no reply).
     pub fn handle_message(&mut self, raw: &str) -> Option<Value> {
+        let now = chrono::Utc::now().timestamp_millis();
+        self.session.last_active = now;
         // Strip a possible UTF-8 BOM (Windows shells prepend one to piped input).
         let raw = raw.trim_start_matches('\u{feff}');
         let msg: Value = match serde_json::from_str(raw) {
@@ -315,7 +378,21 @@ impl McpServer {
 
         let result = match method {
             "initialize" => Ok(self.initialize_result(&params)),
-            "ping" => Ok(json!({})),
+            "ping" => {
+                self.session.last_heartbeat = now;
+                self.session.heartbeat_count += 1;
+                self.session.connected = true;
+                self.session.session_active = true;
+                Ok(json!({
+                    "status": "ok",
+                    "connected": true,
+                    "session_active": true,
+                    "session_id": self.session.session_id,
+                    "uptime_ms": now.saturating_sub(self.session.start_time),
+                    "heartbeats": self.session.heartbeat_count,
+                    "queries_count": self.session.queries_count
+                }))
+            }
             "tools/list" => Ok(tools_list_result()),
             "tools/call" => self.tools_call(&params),
             _ => Err((-32601, format!("method not found: {method}"))),
@@ -326,7 +403,12 @@ impl McpServer {
         })
     }
 
-    fn initialize_result(&self, params: &Value) -> Value {
+    fn initialize_result(&mut self, params: &Value) -> Value {
+        let now = chrono::Utc::now().timestamp_millis();
+        self.session.last_active = now;
+        self.session.last_heartbeat = now;
+        self.session.connected = true;
+        self.session.session_active = true;
         let requested = params
             .get("protocolVersion")
             .and_then(Value::as_str)
@@ -335,11 +417,20 @@ impl McpServer {
             "protocolVersion": requested,
             "capabilities": { "tools": {} },
             "serverInfo": { "name": "repo-graph", "version": env!("CARGO_PKG_VERSION") },
-            "instructions": "The 'repograph_explore' tool is the primary, compound tool. When researching or editing code in this workspace, always prioritize calling the 'repograph_explore' tool. It retrieves exact symbol slices and call graphs in a single query, minimizing token ingestion and context costs."
+            "session": {
+                "sessionId": self.session.session_id,
+                "connected": self.session.connected,
+                "sessionActive": self.session.session_active,
+                "startTime": self.session.start_time,
+                "persistent": true
+            },
+            "instructions": "The Repo Graph MCP server maintains a persistent, session-wide connection across all multi-turn conversation workflows. When researching, exploring, navigating, or modifying code in this workspace, ALWAYS prioritize calling Repo Graph MCP tools (`repograph_explore`, `repograph_files`, `repograph_node`, `repograph_search`, `repograph_impact`, `repograph_callers`, `repograph_callees`, `repograph_status`). Use `repograph_explore` for compound symbol retrieval and call graphs to minimize token ingestion. Use `repograph_status` for connection health and sync status."
         })
     }
 
     fn tools_call(&mut self, params: &Value) -> Result<Value, (i64, String)> {
+        self.session.queries_count += 1;
+        self.session.last_active = chrono::Utc::now().timestamp_millis();
         let name = params
             .get("name")
             .and_then(Value::as_str)
@@ -496,10 +587,14 @@ impl McpServer {
         if let Some(ref warning) = self.sync_warning {
             md = format!("{}\n\n{}", warning, md);
         }
+
+        if let Ok(conn) = self.db() {
+            crate::db::log_agent_query(conn, "", options.scope.unwrap_or(""), "files");
+        }
         Ok(md)
     }
 
-    pub fn read_file(&self, path: &str) -> Result<String, ToolError> {
+    pub fn read_file(&mut self, path: &str) -> Result<String, ToolError> {
         let resolved = self.resolve_inside_root(path)?;
         // Enforced here as well as in the walker: a `.repograph` cache built
         // before the walker learned this denylist still lists `.env` as a
@@ -522,6 +617,10 @@ impl McpServer {
         }
         if let Some(f) = footer {
             content = format!("{}{}", content, f);
+        }
+
+        if let Ok(conn) = self.db() {
+            crate::db::log_agent_query(conn, "", path, "read_file");
         }
 
         Ok(content)
@@ -837,20 +936,29 @@ impl McpServer {
         (header, footer)
     }
 
-    pub fn codegraph_status(&self) -> Result<String, ToolError> {
+    pub fn codegraph_status(&mut self) -> Result<String, ToolError> {
+        let now = chrono::Utc::now().timestamp_millis();
+        self.session.last_active = now;
         let pending_map = crate::watcher::get_pending_map(&self.root);
         let sync_state = if pending_map.is_empty() { "Synced" } else { "Pending" };
+        let (node_count, edge_count) = match self.graph_and_adjacency() {
+            Ok((g, _)) => (g.nodes.len(), g.edges.len()),
+            Err(_) => (0, 0),
+        };
+        let uptime_secs = (now.saturating_sub(self.session.start_time) as f64 / 1000.0).round();
 
         let mut md = String::new();
-        md.push_str("## CodeGraph Status\n\n");
+        md.push_str("## CodeGraph & MCP Session Status\n\n");
         md.push_str(&format!("- **Active Project Root:** `{}`\n", self.root.display()));
-        md.push_str(&format!("- **Sync State:** {}\n\n", sync_state));
+        md.push_str(&format!("- **MCP Connection:** `connected: {}`, `session_active: {}`\n", self.session.connected, self.session.session_active));
+        md.push_str(&format!("- **Session ID:** `{}` (uptime: {}s, {} heartbeats, {} tool queries)\n", self.session.session_id, uptime_secs, self.session.heartbeat_count, self.session.queries_count));
+        md.push_str(&format!("- **Sync State:** {}\n", sync_state));
+        md.push_str(&format!("- **Graph Scale:** {} indexed nodes, {} edges\n\n", node_count, edge_count));
 
         if pending_map.is_empty() {
-            md.push_str("All files are fully indexed. Graph is up-to-date.\n");
+            md.push_str("All files are fully indexed. Graph is up-to-date and MCP session is active.\n");
         } else {
             md.push_str("### Pending Files:\n");
-            let now = chrono::Utc::now().timestamp_millis();
             let mut rows: Vec<(String, i64)> = pending_map.into_iter().collect();
             rows.sort();
             for (rel_path, marked_at) in rows {
@@ -870,6 +978,7 @@ impl McpServer {
             None => None,
         };
         let conn = self.db()?;
+        crate::db::log_agent_query(conn, symbol.unwrap_or(""), path.unwrap_or(""), "callers");
 
         if let Some(sym_name) = symbol {
             let sid_opt: Option<i64>;
@@ -919,6 +1028,7 @@ impl McpServer {
             None => None,
         };
         let conn = self.db()?;
+        crate::db::log_agent_query(conn, symbol.unwrap_or(""), path.unwrap_or(""), "callees");
 
         if let Some(sym_name) = symbol {
             let sid_opt: Option<i64>;
@@ -982,6 +1092,7 @@ impl McpServer {
             None => None,
         };
         let conn = self.db()?;
+        crate::db::log_agent_query(conn, symbol.unwrap_or(""), path.unwrap_or(""), "impact");
 
         if let Some(sym_name) = symbol {
             let sid_opt: Option<i64>;
@@ -1579,14 +1690,14 @@ mod tests {
 
     #[test]
     fn read_file_serves_in_repo_files() {
-        let (_g, server) = temp_repo();
+        let (_g, mut server) = temp_repo();
         let content = server.read_file("src/hooks/useTheme.ts").unwrap();
         assert!(content.contains("useTheme"));
     }
 
     #[test]
     fn read_file_rejects_path_traversal() {
-        let (_g, server) = temp_repo();
+        let (_g, mut server) = temp_repo();
         // A file that definitely exists outside the repo root.
         let outside = std::env::temp_dir().join("repo-graph-outside.txt");
         std::fs::write(&outside, "secret").unwrap();
@@ -1784,7 +1895,7 @@ mod tests {
     /// refuse it independently of how the index was built.
     #[test]
     fn read_file_refuses_credential_files_even_when_indexed() {
-        let (guard, server) = temp_repo();
+        let (guard, mut server) = temp_repo();
         std::fs::write(guard.path().join(".env"), "TOKEN=secret").unwrap();
 
         let err = server.read_file(".env").unwrap_err();
@@ -1810,4 +1921,31 @@ mod tests {
             PathBuf::from(format!("C:{}My-pro{}syscolors", std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR))
         );
     }
+
+    #[test]
+    fn session_persistence_and_ping_heartbeat() {
+        let (_guard, mut server) = temp_repo();
+        assert!(server.session.connected);
+        assert!(server.session.session_active);
+
+        let init = server
+            .handle_message(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#)
+            .unwrap();
+        assert_eq!(init["result"]["session"]["connected"], true);
+        assert_eq!(init["result"]["session"]["sessionActive"], true);
+        assert_eq!(init["result"]["session"]["persistent"], true);
+
+        let ping = server
+            .handle_message(r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#)
+            .unwrap();
+        assert_eq!(ping["result"]["status"], "ok");
+        assert_eq!(ping["result"]["connected"], true);
+        assert_eq!(ping["result"]["session_active"], true);
+        assert_eq!(ping["result"]["heartbeats"], 1);
+
+        let status = server.codegraph_status().unwrap();
+        assert!(status.contains("connected: true") && status.contains("session_active: true"));
+        assert!(status.contains("Session ID:"));
+    }
 }
+

@@ -223,3 +223,76 @@ describe('primarySelection', () => {
     expect(primarySelection(new Set(['a.ts', 'b.ts']))).toBe('b.ts')
   })
 })
+
+describe('graphCache persistence & auto-rehydration', () => {
+  it('persists and restores graph cache successfully', async () => {
+    const { savePersistedGraph, loadPersistedGraph, clearPersistedGraph } = await import('./lib/graphCache')
+    clearPersistedGraph()
+    expect(loadPersistedGraph()).toBeNull()
+
+    const mockGraph = graph({
+      nodes: [node('src/main.ts', ['runApp'])],
+    })
+    const saved = savePersistedGraph('/project/root', mockGraph)
+    expect(saved).toBe(true)
+
+    const loaded = loadPersistedGraph('/project/root')
+    expect(loaded).not.toBeNull()
+    expect(loaded?.root).toBe('/project/root')
+    expect(loaded?.graph.nodes).toHaveLength(1)
+    expect(loaded?.graph.nodes[0].path).toBe('src/main.ts')
+
+    // Root mismatch guard
+    expect(loadPersistedGraph('/other/workspace')).toBeNull()
+
+    clearPersistedGraph()
+    expect(loadPersistedGraph()).toBeNull()
+  })
+
+  it('handles massive 5,000-node graph scaling without crashing or leaking state', async () => {
+    const largeNodes = Array.from({ length: 5000 }, (_, i) => ({
+      ...node(`src/modules/module_${i}.ts`, [`func_${i}`, `helper_${i}`]),
+      rank_order: i + 1,
+      rank_score: 1 / (i + 1),
+    }))
+    const largeEdges = Array.from({ length: 8000 }, (_, i) => ({
+      from_path: `src/modules/module_${i % 5000}.ts`,
+      to_path: `src/modules/module_${(i * 3 + 1) % 5000}.ts`,
+      kind: 'imports' as const,
+    }))
+
+    const largeGraph = graph({
+      nodes: largeNodes,
+      edges: largeEdges,
+    })
+
+    const started = performance.now()
+    useGraphStore.setState({
+      graph: largeGraph,
+      status: 'synced',
+    })
+
+    const ranked = rankedFiles(largeGraph, 50)
+    expect(ranked).toHaveLength(50)
+    expect(ranked[0].path).toBe('src/modules/module_0.ts')
+    const elapsed = performance.now() - started
+    expect(elapsed).toBeLessThan(1000) // Must process under 1 second
+  })
+
+  it('safely handles localStorage quota overflow and corrupted cache', async () => {
+    const { savePersistedGraph, loadPersistedGraph } = await import('./lib/graphCache')
+    
+    // Simulate corrupted JSON in localStorage
+    localStorage.setItem('repograph:cached_graph_data', '{ corrupted-json... ')
+    expect(loadPersistedGraph()).toBeNull()
+
+    // Simulate quota error in setItem
+    const spy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new Error('QuotaExceededError: DOM Exception 22')
+    })
+    const safeSaved = savePersistedGraph('/quota/root', graph({ nodes: [node('test.ts')] }))
+    expect(safeSaved).toBe(false)
+    spy.mockRestore()
+  })
+})
+

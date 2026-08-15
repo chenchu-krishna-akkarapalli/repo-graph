@@ -119,6 +119,11 @@ pub fn start_watcher(app_handle: AppHandle, root: PathBuf) {
                 }
             }
             if any_ok {
+                if let Ok(conn) = crate::db::init_db(&db_path_for(&root_clone)) {
+                    if let Ok(graph) = crate::db::load_graph_from_db(&conn) {
+                        let _ = graph.save_to_cache(&root_clone);
+                    }
+                }
                 let _ = app_clone.emit_all("graph_updated", ());
             }
         }

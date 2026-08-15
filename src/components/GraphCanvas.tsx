@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, Component, type ReactNode, type ErrorInfo } from 'react'
 import ReactFlow, {
   Background,
   BackgroundVariant,
@@ -16,6 +16,58 @@ import CustomFileNode from './nodes/CustomFileNode'
 import CustomFolderNode from './nodes/CustomFolderNode'
 import CustomSymbolNode from './nodes/CustomSymbolNode'
 import EdgeHighlight from './nodes/EdgeHighlight'
+
+interface ErrorBoundaryProps {
+  children: ReactNode
+}
+
+interface ErrorBoundaryState {
+  hasError: boolean
+  error: Error | null
+}
+
+class GraphErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  constructor(props: ErrorBoundaryProps) {
+    super(props)
+    this.state = { hasError: false, error: null }
+  }
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { hasError: true, error }
+  }
+
+  componentDidCatch(error: Error, errorInfo: ErrorInfo) {
+    console.error('[GraphErrorBoundary] Caught canvas render exception:', error, errorInfo)
+  }
+
+  handleRehydrate = () => {
+    this.setState({ hasError: false, error: null })
+    void useGraphStore.getState().load()
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="flex h-full w-full items-center justify-center bg-[#07080B] p-6">
+          <div className="max-w-md rounded-2xl border border-amber-500/40 bg-[#0F1218] p-6 text-center shadow-2xl backdrop-blur-md">
+            <div className="mb-2 text-sm font-semibold text-amber-400">Graph Render Interrupted</div>
+            <p className="text-xs text-white/60 leading-relaxed mb-4">
+              {this.state.error?.message || 'A transient error occurred during graph canvas rendering.'}
+            </p>
+            <button
+              onClick={this.handleRehydrate}
+              className="inline-flex items-center gap-2 rounded-xl bg-violet-600 px-4 py-2 text-xs font-semibold text-white hover:bg-violet-500 transition-all cursor-pointer shadow-lg"
+            >
+              <span>Auto-rehydrate Graph</span>
+            </button>
+          </div>
+        </div>
+      )
+    }
+
+    return this.props.children
+  }
+}
 
 const nodeTypes = { file: CustomFileNode, folder: CustomFolderNode, symbol: CustomSymbolNode }
 const edgeTypes = { highlight: EdgeHighlight }
@@ -285,8 +337,10 @@ function Canvas() {
 
 export default function GraphCanvas() {
   return (
-    <ReactFlowProvider>
-      <Canvas />
-    </ReactFlowProvider>
+    <GraphErrorBoundary>
+      <ReactFlowProvider>
+        <Canvas />
+      </ReactFlowProvider>
+    </GraphErrorBoundary>
   )
 }
