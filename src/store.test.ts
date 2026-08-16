@@ -294,5 +294,37 @@ describe('graphCache persistence & auto-rehydration', () => {
     expect(safeSaved).toBe(false)
     spy.mockRestore()
   })
+
+  it('correctly applies 1-click Agent Presets', () => {
+    const testGraph = graph({
+      nodes: [
+        { ...node('src/auth/service.ts'), routes: ['POST /auth/login'], rank_score: 0.9 },
+        node('src/auth/handler.ts'),
+        node('src/utils.ts'),
+      ],
+      edges: [
+        { from_path: 'src/auth/handler.ts', to_path: 'src/auth/service.ts', kind: 'imports' },
+        { from_path: 'src/auth/service.ts', to_path: 'src/utils.ts', kind: 'imports' },
+      ],
+    })
+
+    useGraphStore.setState({
+      graph: testGraph,
+      contextFiles: new Set(),
+      sidebarTab: 'overview',
+    })
+
+    // 1. Bug Fix Preset adds target file + 1-hop callers
+    useGraphStore.getState().applyBugFixPreset('src/auth/service.ts')
+    expect(useGraphStore.getState().contextFiles.has('src/auth/service.ts')).toBe(true)
+    expect(useGraphStore.getState().contextFiles.has('src/auth/handler.ts')).toBe(true)
+    expect(useGraphStore.getState().sidebarTab).toBe('context')
+
+    // 2. Feature Preset adds route endpoints
+    useGraphStore.getState().clearContextWorkspace()
+    useGraphStore.getState().applyFeaturePreset(0)
+    expect(useGraphStore.getState().contextFiles.size).toBeGreaterThan(0)
+  })
 })
+
 

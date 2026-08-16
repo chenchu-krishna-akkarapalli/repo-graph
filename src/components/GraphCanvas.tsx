@@ -3,6 +3,7 @@ import ReactFlow, {
   Background,
   BackgroundVariant,
   Controls,
+  MiniMap,
   ReactFlowProvider,
   useReactFlow,
   type Edge,
@@ -90,6 +91,8 @@ function Canvas() {
   const collapsedDirs = useGraphStore((s) => s.collapsedDirs)
   const expandedFiles = useGraphStore((s) => s.expandedFiles)
   const minRank = useGraphStore((s) => s.minRank)
+  const densityMode = useGraphStore((s) => s.densityMode)
+  const toggleSpotlightMode = useGraphStore((s) => s.toggleSpotlightMode)
   const select = useGraphStore((s) => s.select)
   const clearSelection = useGraphStore((s) => s.clearSelection)
   const setHovered = useGraphStore((s) => s.setHovered)
@@ -118,7 +121,8 @@ function Canvas() {
       setIngestingCount(0)
       return
     }
-    const build = () => buildFlow(graph, languageFilters, collapsedDirs, expandedFiles, minRank)
+    const build = () =>
+      buildFlow(graph, languageFilters, collapsedDirs, expandedFiles, minRank, densityMode)
     if (graph.nodes.length <= PROGRESSIVE_LOAD_THRESHOLD) {
       // Layout is deliberately state, not a `useMemo`: past the threshold
       // it is deferred a macrotask so the overlay can paint first.
@@ -134,7 +138,7 @@ function Canvas() {
       setIngestingCount(0)
     }, 32)
     return () => clearTimeout(timer)
-  }, [graph, languageFilters, collapsedDirs, expandedFiles, minRank])
+  }, [graph, languageFilters, collapsedDirs, expandedFiles, minRank, densityMode])
 
   useEffect(() => {
     if (!graph || nodes.length === 0 || fittedGraphRef.current === graph) return
@@ -188,14 +192,18 @@ function Canvas() {
     setCenter(x, y, { zoom: Math.max(getZoom(), 1.1), duration: 200 })
   }, [focusRequest, nodes, setCenter, getZoom])
 
-  // Esc deselects everywhere, even when the canvas isn't focused.
+  // Esc deselects, Alt+S toggles spotlight mode
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') clearSelection()
+      if (e.altKey && (e.key.toLowerCase() === 's' || e.code === 'KeyS')) {
+        e.preventDefault()
+        toggleSpotlightMode()
+      }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [clearSelection])
+  }, [clearSelection, toggleSpotlightMode])
 
   if (loadError) {
     return (
@@ -213,18 +221,11 @@ function Canvas() {
   }
 
   if (!graph) {
-    // Skeleton loading state during Indexing (cold boot workflow).
-    return (
-      <div className="grid h-full grid-cols-4 content-start gap-4 p-8">
-        {Array.from({ length: 12 }).map((_, i) => (
-          <div key={i} className="status-dot-pulse h-12 rounded-lg bg-[#0F1218]/60 border border-white/5" />
-        ))}
-      </div>
-    )
+    return null
   }
 
   return (
-    <div className="canvas-container relative w-full h-full">
+    <div className="relative h-full w-full overflow-hidden bg-[#07080B]">
       <ReactFlow
         nodes={nodes}
         edges={edges}
@@ -252,6 +253,19 @@ function Canvas() {
       >
         <Background variant={BackgroundVariant.Dots} gap={28} size={1.5} color="#161B26" />
         <Controls showInteractive={false} position="bottom-left" />
+        <MiniMap
+          nodeColor={(n) => {
+            if (n.data?.domainColorHex) return n.data.domainColorHex
+            if (n.data?.language === 'javascript') return '#3B82F6'
+            if (n.data?.language === 'python') return '#10B981'
+            if (n.data?.language === 'rust') return '#F59E0B'
+            return '#64748B'
+          }}
+          nodeStrokeWidth={2}
+          maskColor="rgba(7, 8, 11, 0.75)"
+          position="bottom-right"
+          className="!bg-[#0F1218]/90 !border !border-white/10 !rounded-xl !shadow-2xl backdrop-blur-md mb-14 mr-4 !w-44 !h-28 overflow-hidden pointer-events-auto"
+        />
       </ReactFlow>
 
       {/* Progressive ingest overlay — large graphs paint this before layout. */}

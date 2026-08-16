@@ -5,25 +5,32 @@ import {
   FileCode2,
   FolderClosed,
   FolderOpen,
-  FolderSearch,
   PanelLeftClose,
   PanelLeftOpen,
   Copy,
   Check,
   Share2,
+  Zap,
+  Bug,
+  Wrench,
+  Layers,
+  AlertTriangle,
 } from 'lucide-react'
 import { rankedFiles, useGraphStore } from '../store'
 import { tauriInvoke } from '../lib/loadGraph'
 import { httpMethodOf, METHOD_BADGE, METHOD_ORDER } from '../lib/httpMethod'
 import { copyContextPrompt } from '../lib/promptExporter'
 import { copyAsciiLayout } from '../lib/layoutExporter'
+import { detectCommunities } from '../lib/community'
+import MermaidViewer from './MermaidViewer'
 import type { FileTreeNode } from '../types'
 
-type NavTab = 'explorer' | 'core' | 'routes' | 'context'
+type NavTab = 'explorer' | 'core' | 'domains' | 'routes' | 'context'
 
 const NAV_TABS: { key: NavTab; label: string }[] = [
   { key: 'explorer', label: 'Explorer' },
   { key: 'core', label: 'Core' },
+  { key: 'domains', label: 'Domains' },
   { key: 'routes', label: 'Routes' },
   { key: 'context', label: 'Context' },
 ]
@@ -78,8 +85,6 @@ export default function LeftSidebar() {
 
   const activeProjectRoot = useGraphStore((s) => s.activeProjectRoot)
   const fileTree = useGraphStore((s) => s.fileTree)
-  const isIndexing = useGraphStore((s) => s.isIndexing)
-  const openProject = useGraphStore((s) => s.openProject)
   const selectProject = useGraphStore((s) => s.selectProject)
   const graph = useGraphStore((s) => s.graph)
   const contextCount = useGraphStore((s) => s.contextFiles.size + s.contextSymbols.size)
@@ -117,6 +122,8 @@ export default function LeftSidebar() {
     }
     return n
   }, [graph])
+
+  const domainsCount = useMemo(() => (graph ? detectCommunities(graph).communities.length : 0), [graph])
 
   const [layoutCopied, setLayoutCopied] = useState(false)
   const handleCopyLayout = async () => {
@@ -174,29 +181,20 @@ export default function LeftSidebar() {
   return (
     <>
       <aside
-        style={{ width }}
-        className="relative flex shrink-0 flex-col border-r border-white/10 bg-[#0D1016]/95 backdrop-blur-md z-30"
+        style={{ width: open ? width : 36 }}
+        className="relative flex h-full shrink-0 flex-col border-r border-white/10 bg-[#090C12]/95 backdrop-blur-xl z-30 select-none transition-[width] duration-150"
       >
-        <div className="flex items-center gap-2 border-b border-white/10 p-2.5">
+        {/* Top Header */}
+        <div className="flex h-10 shrink-0 items-center justify-between border-b border-white/10 px-3">
+          <span className="text-[11px] font-bold uppercase tracking-wider text-white/50">
+            Workspace
+          </span>
           <button
-            onClick={() => void openProject()}
-            disabled={!nativeAvailable || isIndexing}
-            title={
-              nativeAvailable
-                ? 'Select a project folder to index'
-                : 'Available in the desktop app (npm run tauri dev)'
-            }
-            className="flex h-8 flex-1 items-center justify-center gap-2 rounded-md bg-violet-600 hover:bg-violet-500 text-xs font-medium text-white shadow-md shadow-violet-900/20 border-0 transition-all cursor-pointer disabled:cursor-not-allowed disabled:opacity-40"
+            onClick={() => setOpen(!open)}
+            className="flex h-6 w-6 items-center justify-center rounded-md text-white/40 hover:bg-white/10 hover:text-white transition-colors cursor-pointer border-0 bg-transparent"
+            title={open ? 'Collapse sidebar' : 'Expand sidebar'}
           >
-            <FolderSearch size={14} />
-            {isIndexing ? 'Indexing…' : 'Open Folder'}
-          </button>
-          <button
-            onClick={() => setOpen(false)}
-            className="rounded-md p-2 text-white/40 hover:bg-white/[0.06] hover:text-white/90 transition-colors border-0 bg-transparent cursor-pointer"
-            title="Collapse explorer"
-          >
-            <PanelLeftClose size={15} />
+            {open ? <PanelLeftClose size={14} /> : <PanelLeftOpen size={14} />}
           </button>
         </div>
 
@@ -248,7 +246,7 @@ export default function LeftSidebar() {
                       className={[
                         'px-3 py-1.5 text-left text-[10px] font-mono hover:bg-violet-500/15 truncate transition-colors w-full border-0 bg-transparent',
                         p.path.replace(/\\/g, '/') === activeProjectRoot.replace(/\\/g, '/')
-                          ? 'text-violet-300 font-semibold bg-violet-500/10'
+                          ? 'text-blue-300 font-semibold bg-blue-500/10'
                           : 'text-white/60 hover:text-white/95 cursor-pointer'
                       ].join(' ')}
                       title={p.path}
@@ -267,7 +265,14 @@ export default function LeftSidebar() {
         <nav className="flex shrink-0 items-center border-b border-white/10 px-2" role="tablist">
           {NAV_TABS.map((t) => {
             const active = tab === t.key
-            const count = t.key === 'routes' ? routesCount : t.key === 'context' ? contextCount : null
+            const count =
+              t.key === 'routes'
+                ? routesCount
+                : t.key === 'domains'
+                  ? domainsCount
+                  : t.key === 'context'
+                    ? contextCount
+                    : null
             return (
               <button
                 key={t.key}
@@ -275,8 +280,8 @@ export default function LeftSidebar() {
                 aria-selected={active}
                 onClick={() => setTab(t.key)}
                 className={[
-                  'relative flex h-9 flex-1 items-center justify-center gap-1.5 border-0 bg-transparent text-xs font-medium transition-colors cursor-pointer',
-                  active ? 'text-white' : 'text-white/40 hover:text-white/75',
+                  'relative flex h-9 flex-1 items-center justify-center gap-1 border-0 bg-transparent text-[11px] font-medium transition-colors cursor-pointer',
+                  active ? 'text-white font-semibold' : 'text-white/40 hover:text-white/75',
                 ].join(' ')}
               >
                 {t.label}
@@ -288,7 +293,7 @@ export default function LeftSidebar() {
                 <span
                   className={[
                     'absolute inset-x-2 bottom-0 h-0.5 rounded-full transition-all',
-                    active ? 'bg-violet-500' : 'bg-transparent',
+                    active ? 'bg-blue-500' : 'bg-transparent',
                   ].join(' ')}
                 />
               </button>
@@ -311,6 +316,7 @@ export default function LeftSidebar() {
             </div>
           )}
           {tab === 'core' && <CoreTab />}
+          {tab === 'domains' && <DomainsTab />}
           {tab === 'routes' && <RoutesTab />}
           {tab === 'context' && <ContextTab />}
         </div>
@@ -644,23 +650,215 @@ function RoutesTab() {
   )
 }
 
+function DomainsTab() {
+  const graph = useGraphStore((s) => s.graph)
+  const focusNode = useGraphStore((s) => s.focusNode)
+  const [expandedComm, setExpandedComm] = useState<number | null>(null)
+
+  const [showCoupling, setShowCoupling] = useState(false)
+
+  const communityResult = useMemo(() => detectCommunities(graph), [graph])
+  const communities = communityResult.communities
+
+  // Calculate cross-domain coupling matrix
+  const { couplingFlows, circularPairs } = useMemo(() => {
+    if (!graph || communities.length === 0) return { couplingFlows: [], circularPairs: new Set<string>() }
+    const flows: { from: typeof communities[0]; to: typeof communities[0]; count: number }[] = []
+    const edgeCounts = new Map<string, number>()
+
+    for (const c1 of communities) {
+      const c1Set = new Set(c1.nodes)
+      for (const c2 of communities) {
+        if (c1.id === c2.id) continue
+        const c2Set = new Set(c2.nodes)
+        let count = 0
+        for (const e of graph.edges) {
+          if (c1Set.has(e.from_path) && c2Set.has(e.to_path)) {
+            count++
+          }
+        }
+        if (count > 0) {
+          flows.push({ from: c1, to: c2, count })
+          edgeCounts.set(`${c1.id}->${c2.id}`, count)
+        }
+      }
+    }
+
+    const circular = new Set<string>()
+    for (const f of flows) {
+      if (edgeCounts.has(`${f.to.id}->${f.from.id}`)) {
+        const pairKey = [f.from.id, f.to.id].sort().join('<->')
+        circular.add(pairKey)
+      }
+    }
+
+    return {
+      couplingFlows: flows.sort((a, b) => b.count - a.count),
+      circularPairs: circular,
+    }
+  }, [graph, communities])
+
+  if (communities.length === 0) {
+    return (
+      <div className="py-6 px-4 text-center text-xs text-white/40">
+        No architectural domains detected yet.
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-3 p-2.5">
+      <div className="flex items-center justify-between text-[10px] font-mono text-white/40 px-1">
+        <span>{communities.length} ARCHITECTURAL DOMAINS</span>
+        <span className="text-blue-400">LOUVAIN CLUSTERING</span>
+      </div>
+
+      <div className="space-y-2">
+        {communities.map((comm) => {
+          const isExpanded = expandedComm === comm.id
+          return (
+            <div
+              key={comm.id}
+              className={`rounded-xl border ${comm.borderClass} ${comm.bgClass} p-3 transition-all`}
+            >
+              <div className="flex items-center justify-between">
+                <button
+                  onClick={() => focusNode(comm.topHub)}
+                  className="font-semibold text-xs text-left truncate flex-1 hover:underline cursor-pointer border-0 bg-transparent text-white/95"
+                  title={`Focus top hub: ${comm.topHub}`}
+                >
+                  <span className={`mr-1.5 font-bold ${comm.colorClass}`}>●</span>
+                  {comm.name}
+                </button>
+                <button
+                  onClick={() => setExpandedComm(isExpanded ? null : comm.id)}
+                  className="text-[10px] font-mono text-white/60 hover:text-white px-1.5 py-0.5 rounded bg-black/40 border border-white/5 cursor-pointer"
+                >
+                  {comm.nodeCount} files
+                </button>
+              </div>
+
+              <div className="mt-2 flex items-center justify-between text-[10px] font-mono text-white/45">
+                <span>Cohesion: {Math.round(comm.cohesionScore * 100)}%</span>
+                <span className="truncate max-w-[130px]" title={comm.topHub}>
+                  Hub: {comm.topHub.split('/').pop()}
+                </span>
+              </div>
+
+              {isExpanded && (
+                <div className="mt-2.5 pt-2 border-t border-white/10 space-y-1 max-h-44 overflow-y-auto scrollbar-thin">
+                  {comm.nodes.map((nodePath) => (
+                    <button
+                      key={nodePath}
+                      onClick={() => focusNode(nodePath)}
+                      className="block w-full text-left font-mono text-[10px] text-white/70 hover:text-white truncate p-1 rounded hover:bg-white/10 border-0 bg-transparent cursor-pointer"
+                      title={nodePath}
+                    >
+                      /{nodePath}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+
+      {/* Cross-Domain Coupling Matrix & Architecture Boundary Analysis */}
+      <div className="rounded-xl border border-white/10 bg-[#0F1218]/80 p-3 space-y-2">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-1.5 text-xs font-semibold text-white/90">
+            <Layers size={13} className="text-indigo-400" />
+            <span>Domain Coupling Matrix</span>
+          </div>
+          <button
+            onClick={() => setShowCoupling(!showCoupling)}
+            className="text-[10px] font-mono text-white/60 hover:text-white px-2 py-0.5 rounded bg-white/5 hover:bg-white/10 border border-white/10 cursor-pointer"
+          >
+            {showCoupling ? 'Hide' : `${couplingFlows.length} flows`}
+          </button>
+        </div>
+
+        {circularPairs.size > 0 && (
+          <div className="flex items-center gap-1.5 p-2 rounded-lg bg-amber-500/10 border border-amber-500/30 text-[10px] text-amber-300">
+            <AlertTriangle size={12} className="shrink-0 text-amber-400" />
+            <span>Detected {circularPairs.size} circular domain coupling cycle(s)</span>
+          </div>
+        )}
+
+        {showCoupling && (
+          <div className="space-y-1.5 pt-1 max-h-52 overflow-y-auto scrollbar-thin">
+            {couplingFlows.length === 0 ? (
+              <div className="text-[10px] text-white/40 italic py-2 text-center">
+                All domains are completely decoupled.
+              </div>
+            ) : (
+              couplingFlows.map((flow) => {
+                const pairKey = [flow.from.id, flow.to.id].sort().join('<->')
+                const isCircular = circularPairs.has(pairKey)
+
+                return (
+                  <div
+                    key={`${flow.from.id}->${flow.to.id}`}
+                    className={`flex items-center justify-between text-[11px] font-mono p-1.5 rounded-lg border ${
+                      isCircular
+                        ? 'border-amber-500/30 bg-amber-500/5'
+                        : 'border-white/5 bg-black/30'
+                    }`}
+                  >
+                    <div className="flex items-center gap-1 truncate flex-1 mr-2">
+                      <span className={`font-semibold ${flow.from.colorClass} truncate max-w-[75px]`}>
+                        {flow.from.name}
+                      </span>
+                      <span className="text-white/30 text-[10px]">→</span>
+                      <span className={`font-semibold ${flow.to.colorClass} truncate max-w-[75px]`}>
+                        {flow.to.name}
+                      </span>
+                    </div>
+                    <span className="text-[10px] px-1.5 py-0.2 rounded bg-white/10 text-white/80 font-bold">
+                      {flow.count} {flow.count === 1 ? 'edge' : 'edges'}
+                    </span>
+                  </div>
+                )
+              })
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="mt-4 pt-3 border-t border-white/10">
+        <MermaidViewer />
+      </div>
+    </div>
+  )
+}
+
 function ContextTab() {
   const graph = useGraphStore((s) => s.graph)
+  const selected = useGraphStore((s) => s.selected)
   const contextFiles = useGraphStore((s) => s.contextFiles)
   const removeFileFromContext = useGraphStore((s) => s.removeFileFromContext)
   const contextSymbols = useGraphStore((s) => s.contextSymbols)
   const removeSymbolFromContext = useGraphStore((s) => s.removeSymbolFromContext)
   const clearContextWorkspace = useGraphStore((s) => s.clearContextWorkspace)
+  const applyBugFixPreset = useGraphStore((s) => s.applyBugFixPreset)
+  const applyRefactorPreset = useGraphStore((s) => s.applyRefactorPreset)
+  const applyFeaturePreset = useGraphStore((s) => s.applyFeaturePreset)
 
   const [copied, setCopied] = useState(false)
+  const [copyError, setCopyError] = useState<string | null>(null)
 
   const handleCopyPrompt = async () => {
     try {
+      setCopyError(null)
       await copyContextPrompt(contextFiles, contextSymbols)
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
-    } catch (err) {
-      console.error(err)
+    } catch (err: unknown) {
+      console.error('Failed to copy context prompt:', err)
+      const msg = err instanceof Error ? err.message : 'Failed to copy prompt'
+      setCopyError(msg)
+      setTimeout(() => setCopyError(null), 3500)
     }
   }
 
@@ -748,6 +946,47 @@ function ContextTab() {
 
   return (
     <div className="p-3 space-y-2.5">
+      {/* 1-Click Agent Prompt Presets */}
+      <div className="rounded-xl border border-white/10 bg-[#0F1218]/90 p-2.5 space-y-2 shadow-sm">
+        <div className="flex items-center gap-1.5 text-[10px] font-bold tracking-wider text-violet-400 uppercase">
+          <Zap size={12} className="text-violet-400" />
+          <span>1-Click Agent Presets</span>
+        </div>
+        <div className="grid grid-cols-3 gap-1.5">
+          <button
+            onClick={() => {
+              const target = selected.size > 0 ? Array.from(selected)[0] : graph?.nodes[0]?.path
+              if (target) applyBugFixPreset(target)
+            }}
+            className="flex flex-col items-center justify-center p-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 transition-all cursor-pointer text-center"
+            title="Add selected file + 1-hop callers to context workspace"
+          >
+            <Bug size={12} className="mb-0.5" />
+            <span className="text-[10px] font-semibold">Bug Fix</span>
+          </button>
+          <button
+            onClick={() => {
+              applyRefactorPreset(0)
+            }}
+            className="flex flex-col items-center justify-center p-1.5 rounded-lg border border-indigo-500/30 bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-300 transition-all cursor-pointer text-center"
+            title="Add primary domain cluster + transitive blast radius to context workspace"
+          >
+            <Wrench size={12} className="mb-0.5" />
+            <span className="text-[10px] font-semibold">Refactor</span>
+          </button>
+          <button
+            onClick={() => {
+              applyFeaturePreset(0)
+            }}
+            className="flex flex-col items-center justify-center p-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 transition-all cursor-pointer text-center"
+            title="Add domain route endpoints and schema interfaces to context workspace"
+          >
+            <Zap size={12} className="mb-0.5 text-emerald-400" />
+            <span className="text-[10px] font-semibold">Feature</span>
+          </button>
+        </div>
+      </div>
+
       {contextFiles.size === 0 && contextSymbols.size === 0 ? (
         <div className="text-[10px] text-white/30 italic py-4 text-center leading-relaxed">
           Hover explorer rows or click symbol buttons to curate context.
@@ -845,12 +1084,18 @@ function ContextTab() {
             </div>
           </div>
 
+          {copyError && (
+            <div className="rounded-lg border border-rose-500/30 bg-rose-950/20 px-2.5 py-1.5 text-[10px] text-rose-300 text-center">
+              {copyError}
+            </div>
+          )}
+
           {/* Copy prompt button */}
           <button
             onClick={handleCopyPrompt}
             className={[
               'flex h-8 w-full items-center justify-center gap-1.5 rounded-lg text-xs font-semibold text-white transition-all cursor-pointer border-0 shadow-md',
-              copied ? 'bg-emerald-600' : 'bg-violet-600 hover:bg-violet-500'
+              copied ? 'bg-emerald-600' : 'bg-blue-600 hover:bg-blue-500'
             ].join(' ')}
           >
             {copied ? <Check size={13} /> : <Copy size={13} />}

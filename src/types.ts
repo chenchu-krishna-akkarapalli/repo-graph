@@ -108,3 +108,24 @@ export interface AgentActivity {
   action: string
   timestamp: number
 }
+
+export interface DomainSummary {
+  id: number
+  name: string
+  file_count: number
+  top_hub: string
+  cohesion_score: number
+  key_exports: string[]
+  files: string[]
+}
+
+export interface DomainResult {
+  domains: DomainSummary[]
+  file_domain_map: Record<string, number>
+}
+
+export interface GitFileStatus {
+  path: string
+  status: 'modified' | 'added' | 'deleted' | 'untracked'
+}
+

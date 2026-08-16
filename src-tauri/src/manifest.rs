@@ -88,11 +88,13 @@ impl SortBy {
     }
 }
 
-/// Scope and ranking filters for [`build_manifest_with`].
+/// Scope, domain and ranking filters for [`build_manifest_with`].
 #[derive(Debug, Clone, Default)]
 pub struct ManifestOptions<'a> {
     /// Path prefix (`src/api`, `src/api/`, or glob-ish `src/api/**`).
     pub scope: Option<&'a str>,
+    /// Optional domain name or ID filter (e.g. "Auth", "0", "Engine").
+    pub domain: Option<&'a str>,
     /// Keep only the `k` highest-ranked in-scope files.
     pub top_k: Option<usize>,
     /// Keep only files with `rank >= min_rank`.
@@ -152,6 +154,27 @@ pub fn build_manifest_with(
             in_degree: adjacency.dependents_of(&n.path).len() as u32,
         })
         .collect();
+
+    let domain_filter = options.domain.and_then(|dom_query| {
+        let trimmed = dom_query.trim();
+        let domain_res = crate::cluster::detect_domains(graph);
+        // Match by numeric ID or case-insensitive name match
+        if let Ok(id) = trimmed.parse::<usize>() {
+            domain_res.domains.iter().find(|d| d.id == id).map(|d| d.files.clone())
+        } else {
+            let lower = trimmed.to_lowercase();
+            domain_res
+                .domains
+                .iter()
+                .find(|d| d.name.to_lowercase().contains(&lower))
+                .map(|d| d.files.clone())
+        }
+    });
+
+    if let Some(allowed_files) = domain_filter {
+        let set: std::collections::HashSet<String> = allowed_files.into_iter().collect();
+        files.retain(|f| set.contains(&f.path));
+    }
 
     let total_files = files.len();
 

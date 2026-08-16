@@ -1,6 +1,7 @@
 import type { Edge, Node } from 'reactflow'
 import type { RepoGraph, ExtractedSymbol } from '../types'
 import { neighborAttr } from './hoverHighlight'
+import { detectCommunities, COMMUNITY_PALETTE } from './community'
 
 /** Fitts's Law minimums — nodes must stay clickable when zoomed out. */
 export const NODE_WIDTH = 176
@@ -47,6 +48,11 @@ export interface FileNodeData {
   /** In-repo files depending on this one. Route edges excluded, matching the
    *  manifest's `(In: k)` — the same number should not mean two things. */
   dependents: number
+  domainName?: string
+  domainColor?: string
+  domainColorHex?: string
+  domainBg?: string
+  domainBorder?: string
 }
 
 export interface FolderNodeData {
@@ -65,8 +71,8 @@ export interface SymbolNodeData {
 export type FlowNodeData = FileNodeData | FolderNodeData | SymbolNodeData
 
 /**
- * Deterministic layered layout: x = directory depth, y = slot within the
- * column (grouped by directory, then name) so the graph reads like a tree
+ * Deterministic layered layout: x = directory depth or domain cluster, y = slot within the
+ * column (grouped by directory/domain, then rank) so the graph reads cleanly
  * left-to-right. Collapsed directories replace their files with one folder
  * node; edges re-point to it (deduped).
  */
@@ -76,15 +82,23 @@ export function buildFlow(
   collapsedDirs: ReadonlySet<string>,
   expandedFiles: ReadonlySet<string>,
   minRank = 0,
+  densityMode: 'full' | 'core' | 'domains' = 'full',
 ): { nodes: Node<FlowNodeData>[]; edges: Edge[] } {
-  const visible = graph.nodes.filter(
+  let visible = graph.nodes.filter(
     (n) =>
       languageFilters.has(normalizeLanguage(n.language)) &&
-      // `?? 0` means an unranked graph (a cache written before ranking, or a
-      // test fixture) is unaffected at the default `minRank` of 0 rather than
-      // rendering as an empty canvas.
       (n.rank_score ?? 0) >= minRank,
   )
+
+  if (densityMode === 'core') {
+    visible = visible.filter(
+      (n) =>
+        ((n.rank_order ?? 0) > 0 && (n.rank_order ?? 0) <= 30) ||
+        expandedFiles.has(n.path),
+    )
+  }
+
+  const { nodeCommunityMap, communities } = detectCommunities(graph)
 
   // Adjacency baked into the node payload so hover highlighting is a pure
   // CSS attribute match instead of a per-node store lookup.
@@ -121,7 +135,9 @@ export function buildFlow(
     .filter((n) => representative.get(n.path) === n.path)
     .sort((a, b) => a.path.localeCompare(b.path))
   for (const n of fileNodes) {
-    const depth = n.path.split('/').length - 1
+    const communityId = nodeCommunityMap.get(n.path) ?? 0
+    const community = communities.find((c) => c.id === communityId)
+    const depth = densityMode === 'domains' ? communityId : n.path.split('/').length - 1
     const isExpanded = expandedFiles.has(n.path) && n.symbols && n.symbols.length > 0
     const childCount = isExpanded ? n.symbols.length : 0
     const nodeHeight = isExpanded ? 48 + childCount * 44 + 10 : NODE_HEIGHT
@@ -148,6 +164,11 @@ export function buildFlow(
         rank,
         rankOrder: n.rank_order ?? 0,
         dependents: dependentCounts.get(n.path) ?? 0,
+        domainName: community?.name,
+        domainColor: community?.colorClass,
+        domainColorHex: community ? COMMUNITY_PALETTE[community.id % COMMUNITY_PALETTE.length]?.color : undefined,
+        domainBg: community?.bgClass,
+        domainBorder: community?.borderClass,
       },
       style: { width: nodeWidth, height: nodeHeight },
     })

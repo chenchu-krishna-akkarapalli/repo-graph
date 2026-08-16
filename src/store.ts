@@ -1,13 +1,14 @@
 import { create } from 'zustand'
 import Fuse from 'fuse.js'
-import type { FileTreeNode, GraphNode, RepoGraph, SyncStatus, AgentActivity } from './types'
+import type { FileTreeNode, GraphNode, RepoGraph, SyncStatus, AgentActivity, GitFileStatus } from './types'
 import { loadGraph, tauriInvoke } from './lib/loadGraph'
 import { buildTreeFromPaths } from './lib/fileTree'
 import { applyHoverHighlight } from './lib/hoverHighlight'
 import { KNOWN_LANGUAGES } from './lib/layout'
 import { savePersistedGraph, loadPersistedGraph } from './lib/graphCache'
+import { detectCommunities } from './lib/community'
 
-export type SidebarTab = 'overview' | 'dependencies' | 'impact' | 'callgraph'
+export type SidebarTab = 'overview' | 'dependencies' | 'impact' | 'callgraph' | 'context'
 
 const EMPTY: ReadonlySet<string> = new Set()
 
@@ -140,12 +141,26 @@ interface GraphState {
   minRank: number
   setMinRank: (value: number) => void
 
+  densityMode: 'full' | 'core' | 'domains'
+  setDensityMode: (mode: 'full' | 'core' | 'domains') => void
+  spotlightMode: boolean
+  toggleSpotlightMode: () => void
+
   impactSource: string | null
   impactSet: ReadonlySet<string>
 
   sidebarTab: SidebarTab
   sidebarWidth: number
   sidebarOpen: boolean
+
+  gitStatus: ReadonlyMap<string, 'modified' | 'added' | 'deleted' | 'untracked'>
+  showGitDiff: boolean
+  toggleShowGitDiff: () => void
+  refreshGitStatus: () => Promise<void>
+
+  applyBugFixPreset: (filePath: string) => void
+  applyRefactorPreset: (domainId: number) => void
+  applyFeaturePreset: (domainId: number) => void
 
   /** Playbook §7 project slice. */
   activeProjectRoot: string | null
@@ -222,12 +237,21 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   collapsedDirs: EMPTY,
   minRank: 0,
 
+  densityMode: 'full',
+  setDensityMode: (densityMode) => set({ densityMode }),
+  spotlightMode: false,
+  toggleSpotlightMode: () => set((s) => ({ spotlightMode: !s.spotlightMode })),
+
   impactSource: null,
   impactSet: EMPTY,
 
   sidebarTab: 'overview',
   sidebarWidth: 360,
   sidebarOpen: true,
+
+  gitStatus: new Map(),
+  showGitDiff: true,
+  toggleShowGitDiff: () => set((s) => ({ showGitDiff: !s.showGitDiff })),
 
   activeProjectRoot: null,
   fileTree: [],
@@ -274,6 +298,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
         expandedFiles: EMPTY,
         selectedSymbol: null,
       })
+      void get().refreshGitStatus()
     } catch (e) {
       // Auto-Rehydration Layer: If memory graph is missing or load failed,
       // attempt recovery from local persistent cache without crashing.
@@ -371,6 +396,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
         expandedFiles: EMPTY,
         selectedSymbol: null,
       })
+      void get().refreshGitStatus()
     } catch (e) {
       set({
         isIndexing: false,
@@ -504,6 +530,87 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       return { contextFiles: next }
     }),
   clearContextWorkspace: () => set({ contextFiles: EMPTY, contextSymbols: EMPTY }),
+
+  refreshGitStatus: async () => {
+    const root = get().activeProjectRoot
+    const invoke = tauriInvoke()
+    if (!invoke || !root) return
+    try {
+      const res = (await invoke('get_git_status', { root })) as GitFileStatus[]
+      const map = new Map<string, 'modified' | 'added' | 'deleted' | 'untracked'>()
+      for (const item of res) {
+        map.set(item.path, item.status)
+      }
+      set({ gitStatus: map })
+    } catch {
+      // Ignored if git is unavailable
+    }
+  },
+
+  applyBugFixPreset: (filePath: string) => {
+    const graph = get().graph
+    const nextFiles = new Set(get().contextFiles)
+    nextFiles.add(filePath)
+    if (graph) {
+      for (const edge of graph.edges) {
+        if (edge.to_path === filePath) {
+          nextFiles.add(edge.from_path)
+        }
+      }
+    }
+    set({ contextFiles: nextFiles, sidebarTab: 'context', sidebarOpen: true })
+  },
+
+  applyRefactorPreset: (domainId: number) => {
+    const graph = get().graph
+    if (!graph) return
+    const { communities } = detectCommunities(graph)
+    const domain = communities.find((d) => d.id === domainId)
+    const nextFiles = new Set(get().contextFiles)
+    if (domain) {
+      for (const f of domain.nodes) {
+        nextFiles.add(f)
+      }
+      const { dependentsOf } = get()
+      for (const f of domain.nodes) {
+        const queue = [f]
+        while (queue.length > 0) {
+          const curr = queue.pop()!
+          for (const dep of dependentsOf.get(curr) ?? []) {
+            if (!nextFiles.has(dep)) {
+              nextFiles.add(dep)
+              queue.push(dep)
+            }
+          }
+        }
+      }
+    }
+    set({ contextFiles: nextFiles, sidebarTab: 'context', sidebarOpen: true })
+  },
+
+  applyFeaturePreset: (domainId: number) => {
+    const graph = get().graph
+    if (!graph) return
+    const { communities } = detectCommunities(graph)
+    const domain = communities.find((d) => d.id === domainId)
+    const nextFiles = new Set(get().contextFiles)
+    if (domain) {
+      const domainNodeSet = new Set(domain.nodes)
+      for (const node of graph.nodes) {
+        if (domainNodeSet.has(node.path)) {
+          if (node.routes.length > 0 || (node.rank_score ?? 0) >= 0.5) {
+            nextFiles.add(node.path)
+          }
+        }
+      }
+      if (nextFiles.size === 0) {
+        for (const f of domain.nodes.slice(0, 5)) {
+          nextFiles.add(f)
+        }
+      }
+    }
+    set({ contextFiles: nextFiles, sidebarTab: 'context', sidebarOpen: true })
+  },
 
   addSymbolToContext: (path, symbolName) =>
     set((s) => {

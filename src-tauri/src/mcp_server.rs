@@ -448,9 +448,13 @@ impl McpServer {
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
         let outcome = match name {
+            "repograph_domains" => {
+                self.repograph_domains()
+            }
             "repograph_files" => {
                 let options = ManifestOptions {
                     scope: args.get("scope").and_then(Value::as_str),
+                    domain: args.get("domain").and_then(Value::as_str),
                     // `as_u64` rejects a float or a negative, which is the
                     // behaviour we want — a bad `top_k` should be ignored, not
                     // silently rounded into a different query.
@@ -592,6 +596,36 @@ impl McpServer {
             crate::db::log_agent_query(conn, "", options.scope.unwrap_or(""), "files");
         }
         Ok(md)
+    }
+
+    pub fn repograph_domains(&mut self) -> Result<String, ToolError> {
+        let (graph, _) = self.graph_and_adjacency()?;
+        let result = crate::cluster::detect_domains(graph);
+
+        let mut lines = Vec::new();
+        lines.push("# Architectural Domains (Community Partitioning)".to_string());
+        lines.push(format!(
+            "Detected {} architectural domains across {} files.\nUse `repograph_files(domain=\"<domain_name>\")` to view files in a domain.\n",
+            result.domains.len(),
+            graph.nodes.len()
+        ));
+
+        for d in &result.domains {
+            lines.push(format!("## Domain {}: {}", d.id, d.name));
+            lines.push(format!("- **Files:** {} (Cohesion: {:.0}%)", d.file_count, d.cohesion_score * 100.0));
+            lines.push(format!("- **Top Hub:** `{}`", d.top_hub));
+            if !d.key_exports.is_empty() {
+                lines.push(format!("- **Key Exports:** {}", d.key_exports.join(", ")));
+            }
+            let sample_files: Vec<String> = d.files.iter().take(4).map(|f| format!("`{}`", f)).collect();
+            lines.push(format!("- **Sample Files:** {}\n", sample_files.join(", ")));
+        }
+
+        if let Ok(conn) = self.db() {
+            crate::db::log_agent_query(conn, "", "domains", "domains");
+        }
+
+        Ok(lines.join("\n"))
     }
 
     pub fn read_file(&mut self, path: &str) -> Result<String, ToolError> {
@@ -1301,6 +1335,10 @@ fn tools_list_result() -> Value {
                         "type": "string",
                         "description": "Optional path prefix to scope the manifest, e.g. 'src/api/**'"
                     },
+                    "domain": {
+                        "type": "string",
+                        "description": "Optional architectural domain name or ID (e.g. 'Auth' or '0') to filter files strictly to that cluster."
+                    },
                     "top_k": {
                         "type": "integer",
                         "minimum": 1,
@@ -1318,6 +1356,17 @@ fn tools_list_result() -> Value {
                         "description": "Presentation order only (default 'rank'). top_k and min_rank always select by rank."
                     }
                 }
+            }
+        }));
+    }
+
+    if allowed.contains(&"domains".to_string()) {
+        tools.push(json!({
+            "name": "repograph_domains",
+            "description": "Returns high-level architectural domains detected by Louvain community clustering with cohesion scores, top hubs, and key exports. Cost: ~180 tokens.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
             }
         }));
     }
@@ -1946,6 +1995,21 @@ mod tests {
         let status = server.codegraph_status().unwrap();
         assert!(status.contains("connected: true") && status.contains("session_active: true"));
         assert!(status.contains("Session ID:"));
+    }
+
+    #[test]
+    fn repograph_domains_and_domain_filtering() {
+        let (_guard, mut server) = temp_repo();
+        let domains = server.repograph_domains().unwrap();
+        assert!(domains.contains("Architectural Domains"));
+        assert!(domains.contains("Core Application"));
+
+        let options = ManifestOptions {
+            domain: Some("Core"),
+            ..Default::default()
+        };
+        let filtered_manifest = server.get_manifest_with(&options).unwrap();
+        assert!(filtered_manifest.contains("src/hooks/useTheme.ts") || filtered_manifest.contains("src/components/Button.tsx"));
     }
 }
 

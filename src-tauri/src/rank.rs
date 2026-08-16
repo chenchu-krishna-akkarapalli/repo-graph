@@ -693,4 +693,41 @@ mod tests {
         assert!(score(&g, "src/App.tsx") > score(&g, "src/components/Widget.tsx"));
         assert_eq!(order(&g, "src/App.tsx"), 1);
     }
+
+    #[test]
+    fn adamic_adar_scoring_ranks_shared_neighborhoods() {
+        use std::collections::HashSet;
+        let mut neighbors_u = HashSet::new();
+        neighbors_u.insert(2);
+        neighbors_u.insert(3);
+
+        let mut neighbors_v = HashSet::new();
+        neighbors_v.insert(2);
+        neighbors_v.insert(4);
+
+        let degrees = vec![0, 0, 5, 2, 8];
+        let score = adamic_adar_similarity(&neighbors_u, &neighbors_v, &degrees);
+        // Shared neighbor 2 has degree 5 (score: 1.0 / ln(5) = 0.621)
+        assert!(score > 0.60 && score < 0.65);
+    }
+}
+
+/// Computes the Adamic-Adar topological similarity score between two nodes:
+/// Score(u, v) = Sum_{w in Neighbors(u) intersection Neighbors(v)} 1 / ln(Degree(w))
+/// Higher values indicate that two nodes share tightly focused, non-hub neighbors.
+pub fn adamic_adar_similarity(
+    neighbors_u: &std::collections::HashSet<usize>,
+    neighbors_v: &std::collections::HashSet<usize>,
+    degrees: &[usize],
+) -> f64 {
+    let mut score = 0.0;
+    for &shared_neighbor in neighbors_u.intersection(neighbors_v) {
+        let deg = degrees.get(shared_neighbor).copied().unwrap_or(1);
+        if deg > 1 {
+            score += 1.0 / (deg as f64).ln();
+        } else {
+            score += 1.0;
+        }
+    }
+    score
 }

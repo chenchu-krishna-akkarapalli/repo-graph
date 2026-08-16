@@ -15,6 +15,8 @@ import {
 } from 'lucide-react'
 import { primarySelection, useGraphStore, type SidebarTab } from '../store'
 import { tauriInvoke } from '../lib/loadGraph'
+import { detectCommunities } from '../lib/community'
+import MermaidViewer from './MermaidViewer'
 import type { CallGraph } from '../types'
 
 const TABS: { key: SidebarTab; label: string }[] = [
@@ -176,7 +178,16 @@ function TabBar() {
 
 function SelectedFilePanel({ path }: { path: string }) {
   const tab = useGraphStore((s) => s.sidebarTab)
-  const node = useGraphStore((s) => s.graph?.nodes.find((n) => n.path === path))
+  const graph = useGraphStore((s) => s.graph)
+  const node = graph?.nodes.find((n) => n.path === path)
+
+  const community = useMemo(() => {
+    if (!graph) return null
+    const res = detectCommunities(graph)
+    const commId = res.nodeCommunityMap.get(path)
+    return commId !== undefined ? res.communities.find((c) => c.id === commId) : null
+  }, [graph, path])
+
   if (!node) return null
   return (
     <div className="min-h-0 flex-1 overflow-y-auto p-4 space-y-3">
@@ -185,12 +196,17 @@ function SelectedFilePanel({ path }: { path: string }) {
         <div className="mb-1 truncate font-mono text-[13px] font-medium text-white/90" title={node.path}>
           /{node.path}
         </div>
-        <div className="flex items-center gap-3 text-xs text-white/40 font-mono">
-          <span className="capitalize text-violet-300">{node.language}</span>
+        <div className="flex flex-wrap items-center gap-2 text-xs text-white/40 font-mono">
+          <span className="capitalize text-blue-300">{node.language}</span>
           <span>·</span>
           <span>{(node.size_bytes / 1024).toFixed(1)} KB</span>
           <span>·</span>
           <span className="text-white/60">{node.in_degree} in / {node.out_degree} out</span>
+          {community && (
+            <span className={`ml-auto px-2 py-0.5 rounded-full text-[9px] font-semibold border ${community.colorClass} ${community.bgClass} ${community.borderClass}`}>
+              {community.name}
+            </span>
+          )}
         </div>
       </div>
 
@@ -334,6 +350,10 @@ function OverviewTab({ path }: { path: string }) {
           </div>
         )}
       </Accordion>
+
+      <div className="my-3">
+        <MermaidViewer rootPath={path} />
+      </div>
 
       <ActionRow path={path} />
     </>

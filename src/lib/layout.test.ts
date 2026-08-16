@@ -191,6 +191,33 @@ describe('rank rendering', () => {
     const child = nodes.find((n) => n.id === 'a.ts#go')!
     expect(child.style?.width).toBe((parent.style?.width as number) - 20)
   })
+
+  it('densityMode core filters to top 30 ranked files', () => {
+    const nodesList = Array.from({ length: 50 }, (_, i) => ({
+      ...node(`file_${i}.ts`),
+      rank_score: (50 - i) / 50,
+      rank_order: i + 1,
+    }))
+    const g = graph({ nodes: nodesList })
+    const { nodes: coreNodes } = buildFlow(g, ALL_LANGUAGES, new Set(), new Set(), 0, 'core')
+    expect(coreNodes.length).toBe(30)
+    expect(coreNodes.map((n) => n.id)).toContain('file_0.ts')
+    expect(coreNodes.map((n) => n.id)).not.toContain('file_40.ts')
+  })
+
+  it('densityMode domains assigns domain metadata to nodes', () => {
+    const g = graph({
+      nodes: [
+        { ...node('src/auth/login.ts'), rank_score: 0.8, rank_order: 1 },
+        { ...node('src/auth/session.ts'), rank_score: 0.7, rank_order: 2 },
+      ],
+      edges: [{ from_path: 'src/auth/login.ts', to_path: 'src/auth/session.ts', kind: 'imports' as const }],
+    })
+    const { nodes } = buildFlow(g, ALL_LANGUAGES, new Set(), new Set(), 0, 'domains')
+    expect(nodes.length).toBe(2)
+    const login = nodes.find((n) => n.id === 'src/auth/login.ts')
+    expect((login?.data as FileNodeData).domainName).toBeDefined()
+  })
 })
 
 describe('dirOf', () => {

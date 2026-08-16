@@ -95,9 +95,8 @@ function CustomSymbolNode({ id, data }: NodeProps<SymbolNodeData>) {
       data-node-neighbors={data.neighbors}
       className={[
         'graph-node flex h-[34px] w-full items-center justify-between rounded-lg border px-2.5 text-[11px] font-mono backdrop-blur-md',
-        // Selection (violet) always wins over the semantic theme.
         isSelected
-          ? '!border-violet-500 bg-[#1d1630] text-white shadow-[0_0_12px_rgba(139,92,246,0.6)] ring-1 ring-violet-500/50'
+          ? '!border-blue-400 bg-[#141C2B] text-white shadow-[0_0_10px_rgba(59,130,246,0.3)] ring-1 ring-blue-400/40'
           : theme.container,
         isAgentTarget ? 'agent-radar-node' : '',
       ].join(' ')}

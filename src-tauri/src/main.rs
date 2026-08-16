@@ -191,7 +191,15 @@ fn set_watch_debounce(ms: u64) -> Result<(), String> {
 /// Every tool the MCP server can expose. Without this env var the server's
 /// `tools/list` returns only `repograph_explore`, which reads to new users as
 /// "the integration is broken" — so every generated snippet sets it.
-const MCP_ALL_TOOLS: &str = "explore,files,node,search,impact,callers,callees,status";
+const MCP_ALL_TOOLS: &str = "explore,files,domains,node,search,impact,callers,callees,status";
+
+#[tauri::command]
+fn get_domains(graph_json: String) -> Result<String, String> {
+    let graph: repo_graph::graph::Graph = serde_json::from_str(&graph_json)
+        .map_err(|e| format!("invalid graph json: {e}"))?;
+    let res = repo_graph::cluster::detect_domains(&graph);
+    serde_json::to_string(&res).map_err(|e| format!("failed to serialize domains: {e}"))
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct McpConfigSnippet {
@@ -758,6 +766,72 @@ fn explore(symbols: Vec<String>) -> Result<ExplorePayload, String> {
     Ok(ExplorePayload { files, paths })
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct GitFileStatus {
+    path: String,
+    status: String,
+}
+
+#[tauri::command]
+fn get_git_status(root: String) -> Result<Vec<GitFileStatus>, String> {
+    let clean_root = clean_unc_path(&root);
+    let root_path = PathBuf::from(&clean_root);
+    if !root_path.is_dir() {
+        return Err(format!("Not a valid directory: {}", root));
+    }
+
+    let output = std::process::Command::new("git")
+        .arg("status")
+        .arg("--porcelain=v1")
+        .current_dir(&root_path)
+        .output();
+
+    let output = match output {
+        Ok(out) => out,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut results = Vec::new();
+
+    for line in stdout.lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        let code = &line[0..2];
+        let raw_path = line[3..].trim();
+        let path = if let Some((_, new_p)) = raw_path.split_once(" -> ") {
+            new_p.trim_matches('"')
+        } else {
+            raw_path.trim_matches('"')
+        };
+
+        let normalized_path = path.replace('\\', "/");
+        let status = if code.contains('M') {
+            "modified"
+        } else if code.contains('A') {
+            "added"
+        } else if code.starts_with('?') {
+            "untracked"
+        } else if code.contains('D') {
+            "deleted"
+        } else {
+            "modified"
+        };
+
+        results.push(GitFileStatus {
+            path: normalized_path,
+            status: status.to_string(),
+        });
+    }
+
+    Ok(results)
+}
+
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -777,7 +851,9 @@ fn main() {
             set_watch_debounce,
             check_agent_scaffold,
             trigger_agent_scaffold,
-            get_mcp_config_snippet
+            get_mcp_config_snippet,
+            get_domains,
+            get_git_status
         ])
         .setup(|app| {
             let app_handle = app.handle();
