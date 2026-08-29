@@ -1,80 +1,83 @@
-//! `mcp_server` binary.
+﻿//! `mcp_server` binary.
 //!
 //! Usage:
-//!   `mcp_server [repo_root]`        — serve the read-only MCP API (stdio)
-//!   `mcp_server index <repo_root>`  — walk + parse the repo and write
-//!                                     `.repograph/graph.json`
-//!   `mcp_server install-rules <repo_root>` — append/update explore rules in workspace
+//!   `mcp_server [OPTIONS] [repo_root]` — serve the read-only MCP API (stdio)
+//!   `mcp_server index <repo_root>`      — walk + parse the repo and write `.repograph/graph.json` and `.repograph/graph.db`
+//!   `mcp_server install-rules <repo_root>` — provision/update agent rules in workspace
+//!
+//! Options:
+//!   `-r, --root <PATH>`   Target project directory
+//!   `-t, --tools <TOOLS>` Comma-separated list of tools or 'all'
 
 use repo_graph::mcp_server::McpServer;
 use std::path::{Path, PathBuf};
 
 fn install_rules(root: &Path) {
-    let marker = "\n# REPOGRAPH_EXPLORE_MARKER\nWhen researching or editing code in this workspace, always prioritize calling the `repograph_explore` tool/CLI. It retrieves exact symbol slices and call graphs in a single query, minimizing token ingestion and context costs.\n# END_REPOGRAPH_EXPLORE_MARKER\n";
-
-    for rel_path in &["my-agent/RULES.md", ".agents/AGENTS.md"] {
-        let file_path = root.join(rel_path);
-        if file_path.is_file() {
-            match std::fs::read_to_string(&file_path) {
-                Ok(content) => {
-                    let mut new_content = content.clone();
-                    if let Some(start_idx) = content.find("# REPOGRAPH_EXPLORE_MARKER") {
-                        if let Some(end_idx) = content.find("# END_REPOGRAPH_EXPLORE_MARKER") {
-                            let end_pos = end_idx + "# END_REPOGRAPH_EXPLORE_MARKER".len();
-                            new_content.replace_range(start_idx..end_pos, marker.trim());
-                        } else {
-                            new_content.push_str(marker);
-                        }
-                    } else {
-                        new_content.push_str(marker);
-                    }
-                    if let Err(e) = std::fs::write(&file_path, new_content) {
-                        eprintln!("Failed to write to {}: {e}", file_path.display());
-                    } else {
-                        eprintln!("Successfully updated rules in {}", file_path.display());
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Failed to read {}: {e}", file_path.display());
-                }
-            }
-        } else {
-            eprintln!("Rules file {} does not exist (skipping)", file_path.display());
-        }
-    }
+    let _ = repo_graph::agent_scaffold::ensure_agent_scaffold(root);
+    let _ = repo_graph::rule_injector::ensure_workspace_rules(root);
+    eprintln!("Successfully ensured agent rules and scaffold in {}", root.display());
 }
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let first = args.next();
+    let mut root_arg: Option<PathBuf> = None;
 
-    if first.as_deref() == Some("index") {
-        let root = args.next().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-        match repo_graph::indexer::index_repo(&root, None) {
-            Ok(s) => {
-                eprintln!(
-                    "indexed {} files → {} edges, {} external deps, {} warnings in {} ms",
-                    s.files, s.edges, s.external_dependencies, s.warnings, s.duration_ms
-                );
-                eprintln!("graph cache written to {}", s.cache_path.display());
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "index" => {
+                let root = args.next().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+                match repo_graph::indexer::index_repo(&root, None) {
+                    Ok(s) => {
+                        eprintln!(
+                            "indexed {} files → {} edges, {} external deps, {} warnings in {} ms",
+                            s.files, s.edges, s.external_dependencies, s.warnings, s.duration_ms
+                        );
+                        eprintln!("graph cache written to {}", s.cache_path.display());
+                    }
+                    Err(e) => {
+                        eprintln!("repo-graph index: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                return;
             }
-            Err(e) => {
-                eprintln!("repo-graph index: {e}");
-                std::process::exit(1);
+            "install-rules" => {
+                let root = args.next().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+                install_rules(&root);
+                return;
             }
+            "--root" | "-r" => {
+                if let Some(r) = args.next() {
+                    root_arg = Some(PathBuf::from(r));
+                }
+            }
+            "--tools" | "-t" => {
+                if let Some(t) = args.next() {
+                    std::env::set_var("REPOGRAPH_MCP_TOOLS", t);
+                }
+            }
+            "--help" | "-h" => {
+                eprintln!("Repo Graph MCP Server v1.4");
+                eprintln!("Usage: mcp_server [OPTIONS] [REPO_ROOT]\n");
+                eprintln!("Commands:");
+                eprintln!("  index [REPO_ROOT]          Walk and parse the repo into .repograph/graph.db");
+                eprintln!("  install-rules [REPO_ROOT]  Provision agent rules into workspace\n");
+                eprintln!("Options:");
+                eprintln!("  -r, --root <PATH>          Set target project root");
+                eprintln!("  -t, --tools <TOOLS>        Comma-separated list of enabled tools (or 'all')");
+                eprintln!("  -h, --help                 Print help");
+                return;
+            }
+            other if !other.starts_with('-') && root_arg.is_none() => {
+                root_arg = Some(PathBuf::from(other));
+            }
+            _ => {}
         }
-        return;
     }
 
-    if first.as_deref() == Some("install-rules") {
-        let root = args.next().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-        install_rules(&root);
-        return;
-    }
-
-    let root = first
-        .or_else(|| std::env::var("REPO_GRAPH_ROOT").ok())
-        .map(PathBuf::from)
+    let root = root_arg
+        .or_else(|| std::env::var("REPOGRAPH_PROJECT_ROOT").ok().map(PathBuf::from))
+        .or_else(|| std::env::var("REPO_GRAPH_ROOT").ok().map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("auto"));
 
     let mut server = match McpServer::new(&root) {

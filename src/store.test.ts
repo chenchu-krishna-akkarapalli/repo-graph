@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AgentActivity, RepoGraph } from './types'
 import { agentActivityTargets, primarySelection, rankedFiles, useGraphStore } from './store'
+import { cleanUncPath } from './lib/fileTree'
 
 function graph(partial: Partial<RepoGraph> = {}): RepoGraph {
   return {
@@ -324,6 +325,34 @@ describe('graphCache persistence & auto-rehydration', () => {
     useGraphStore.getState().clearContextWorkspace()
     useGraphStore.getState().applyFeaturePreset(0)
     expect(useGraphStore.getState().contextFiles.size).toBeGreaterThan(0)
+  })
+
+  it('atomically resets graph state on resetGraphState and prevents stale node leaks', () => {
+    const testGraph = graph({
+      nodes: [node('src/index.ts')],
+    })
+    useGraphStore.setState({
+      graph: testGraph,
+      activeProjectRoot: '/old/project',
+      selected: new Set(['src/index.ts']),
+      contextFiles: new Set(['src/index.ts']),
+      status: 'synced',
+    })
+
+    useGraphStore.getState().resetGraphState()
+    const state = useGraphStore.getState()
+    expect(state.graph).toBeNull()
+    expect(state.activeProjectRoot).toBeNull()
+    expect(state.selected.size).toBe(0)
+    expect(state.contextFiles.size).toBe(0)
+    expect(state.status).toBe('stale')
+  })
+
+  it('correctly cleans UNC path prefixes', () => {
+    expect(cleanUncPath('//?/C:/My-pro/innovexinfo/frontend')).toBe('C:/My-pro/innovexinfo/frontend')
+    expect(cleanUncPath('\\\\?\\C:\\My-pro\\innovexinfo\\frontend')).toBe('C:/My-pro/innovexinfo/frontend')
+    expect(cleanUncPath('C:/My-pro/innovexinfo/frontend')).toBe('C:/My-pro/innovexinfo/frontend')
+    expect(cleanUncPath('')).toBe('')
   })
 })
 

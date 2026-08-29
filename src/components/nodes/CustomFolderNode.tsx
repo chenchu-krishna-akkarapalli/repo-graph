@@ -11,7 +11,7 @@ function CustomFolderNode({ id, data }: NodeProps<FolderNodeData>) {
     <div
       data-node-path={id}
       data-node-neighbors="|"
-      className="graph-node flex h-full cursor-pointer items-center gap-2 rounded-xl border border-dashed border-slate-600/60 bg-[#11151E]/90 px-3 text-white/80 hover:border-violet-400/80 hover:bg-[#1a202c]/90 backdrop-blur-md shadow-md"
+      className="graph-node flex h-full cursor-pointer items-center gap-2 rounded-xl border border-dashed border-slate-600/40 bg-[#11151E]/60 px-3 text-white/85 hover:border-violet-400/80 hover:bg-[#1a202c]/75 backdrop-blur-xl shadow-lg shadow-black/40 transition-all duration-200"
       onClick={() => toggleDir(data.dir)}
       title={`Expand /${data.dir}`}
     >

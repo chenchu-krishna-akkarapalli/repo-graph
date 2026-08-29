@@ -4,20 +4,51 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod agent_scaffold;
+use repo_graph::agent_scaffold;
 
 use repo_graph::graph::Graph;
 use repo_graph::tree::FileTreeNode;
 use std::path::PathBuf;
 use tauri::Manager;
 
-/// Repo root discovery: explicit override, else walk up from the current
-/// directory until a `.repograph/graph.json` cache is found (in dev the
-/// cwd is `src-tauri/`, so the project root is one level up).
+static ACTIVE_PROJECT_ROOT: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+/// Repo root discovery: active project in UI memory, active_project.json registry,
+/// explicit REPO_GRAPH_ROOT override, else walk up from cwd until `.repograph/graph.json` or `.repograph/graph.db` is found.
 fn find_repo_root() -> Option<PathBuf> {
-    if let Ok(root) = std::env::var("REPO_GRAPH_ROOT") {
-        return Some(PathBuf::from(root));
+    if let Ok(lock) = ACTIVE_PROJECT_ROOT.read() {
+        if let Some(ref r) = *lock {
+            if r.exists() && (r.join(".repograph/graph.db").is_file() || r.join(".repograph/graph.json").is_file()) {
+                return Some(r.clone());
+            }
+        }
     }
+
+    if let Ok(root) = std::env::var("REPO_GRAPH_ROOT") {
+        let p = PathBuf::from(root);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+
+    if let Some(registry_path) = repo_graph::paths::active_project_registry() {
+        if registry_path.is_file() {
+            if let Ok(c) = std::fs::read_to_string(&registry_path) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&c) {
+                    if let Some(root_str) = json.get("active_project_root").and_then(|v| v.as_str()) {
+                        let clean = root_str
+                            .trim_start_matches("//?/")
+                            .trim_start_matches(r"\\?\");
+                        let p = PathBuf::from(clean);
+                        if p.exists() && (p.join(".repograph/graph.db").is_file() || p.join(".repograph/graph.json").is_file()) {
+                            return Some(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut dir = std::env::current_dir().ok()?;
     loop {
         if dir.join(".repograph/graph.db").is_file() || dir.join(".repograph/graph.json").is_file() {
@@ -31,6 +62,10 @@ fn find_repo_root() -> Option<PathBuf> {
 
 /// Writes the absolute project root and synctime to the shared active_project.json registry.
 fn write_active_project_registry(root: &std::path::Path) {
+    if let Ok(mut lock) = ACTIVE_PROJECT_ROOT.write() {
+        *lock = Some(root.to_path_buf());
+    }
+
     let Some(registry_path) = repo_graph::paths::active_project_registry() else {
         eprintln!("[registry] no writable state directory; skipping active-project write");
         return;
@@ -47,7 +82,6 @@ fn write_active_project_registry(root: &std::path::Path) {
         .unwrap_or(&normalized)
         .to_string();
 
-
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let json_block = serde_json::json!({
         "active_project_root": clean_normalized,
@@ -63,9 +97,13 @@ static RECENT_PROJECTS_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn clean_unc_path(path: &str) -> String {
     let normalized = path.replace('\\', "/");
-    let cleaned = normalized
-        .trim_start_matches("//?/")
-        .trim_start_matches(r"\\?\");
+    let mut cleaned = normalized.as_str();
+    while cleaned.starts_with("//?/") || cleaned.starts_with(r"\\?\") || cleaned.starts_with(r"//?\") || cleaned.starts_with(r"\\?/") {
+        cleaned = &cleaned[4..];
+    }
+    while cleaned.starts_with("//?") || cleaned.starts_with(r"\\?") {
+        cleaned = &cleaned[3..];
+    }
     cleaned.to_string()
 }
 
@@ -191,7 +229,34 @@ fn set_watch_debounce(ms: u64) -> Result<(), String> {
 /// Every tool the MCP server can expose. Without this env var the server's
 /// `tools/list` returns only `repograph_explore`, which reads to new users as
 /// "the integration is broken" — so every generated snippet sets it.
-const MCP_ALL_TOOLS: &str = "explore,files,domains,node,search,impact,callers,callees,status";
+const MCP_ALL_TOOLS: &str = "explore,files,domains,node,search,impact,callers,callees,status,edit,write,delete,batch_edit,edit_symbol,skeleton,trace";
+
+#[tauri::command]
+fn get_file_skeleton(path: String) -> Result<String, String> {
+    let root = find_repo_root().ok_or_else(|| "no active project root found".to_string())?;
+    let normalized = path.replace('\\', "/").trim_start_matches("./").to_string();
+    let abs_path = root.join(&normalized);
+    let canonical = dunce::canonicalize(&abs_path)
+        .or_else(|_| abs_path.canonicalize())
+        .map_err(|e| format!("file not found '{normalized}': {e}"))?;
+    if !canonical.starts_with(&root) {
+        return Err("path traversal outside project root is prohibited".to_string());
+    }
+    let content = std::fs::read_to_string(&canonical)
+        .map_err(|e| format!("cannot read '{normalized}': {e}"))?;
+    let language = repo_graph::walker::language_for(&canonical);
+    Ok(repo_graph::skeleton::extract_skeleton(&content, &language))
+}
+
+#[tauri::command]
+fn get_execution_trace(entrypoint: String, depth: Option<usize>) -> Result<String, String> {
+    let root = find_repo_root().ok_or_else(|| "no active project root found".to_string())?;
+    let db_path = root.join(".repograph/graph.db");
+    let conn = repo_graph::db::init_db(&db_path).map_err(|e| e.to_string())?;
+    let (trace_md, _) = repo_graph::db::get_execution_trace(&conn, &root, &entrypoint, depth.unwrap_or(3))
+        .map_err(|e| e.to_string())?;
+    Ok(trace_md)
+}
 
 #[tauri::command]
 fn get_domains(graph_json: String) -> Result<String, String> {
@@ -266,8 +331,8 @@ fn resolve_mcp_binary(app_handle: &tauri::AppHandle) -> (PathBuf, bool) {
 #[tauri::command]
 fn get_mcp_config_snippet(project_root: String, app_handle: tauri::AppHandle) -> Result<McpConfigSnippet, String> {
     let (binary_path, binary_exists) = resolve_mcp_binary(&app_handle);
-    let path_str = binary_path.to_string_lossy().replace('\\', "/");
-    let root_str = project_root.replace('\\', "/");
+    let path_str = clean_unc_path(&dunce::simplified(&binary_path).to_string_lossy());
+    let root_str = clean_unc_path(&project_root);
 
     let claude_desktop_json = serde_json::to_string_pretty(&serde_json::json!({
         "mcpServers": {
@@ -315,6 +380,12 @@ fn read_graph(app_handle: tauri::AppHandle) -> Result<Graph, String> {
     let root = find_repo_root().ok_or_else(|| {
         "no .repograph/graph.db or .repograph/graph.json found — run: mcp_server index <repo_root>".to_string()
     })?;
+    if let Err(e) = agent_scaffold::ensure_agent_scaffold(&root) {
+        eprintln!("[scaffold] skipped for {}: {e}", root.display());
+    }
+    if let Err(e) = repo_graph::rule_injector::ensure_workspace_rules(&root) {
+        eprintln!("[rule_injector] skipped for {}: {e}", root.display());
+    }
     write_active_project_registry(&root);
     repo_graph::watcher::start_watcher(app_handle, root.clone());
     
@@ -341,7 +412,7 @@ fn read_graph(app_handle: tauri::AppHandle) -> Result<Graph, String> {
         .max_by_key(|&(_, count)| count)
         .map(|(lang, _)| lang)
         .unwrap_or_else(|| "unknown".to_string());
-    let root_str = root.to_string_lossy().to_string();
+    let root_str = clean_unc_path(&root.to_string_lossy());
     let _ = add_recent_project(root_str, graph.nodes.len() as i64, symbol_count, primary_lang);
 
     eprintln!(
@@ -361,23 +432,28 @@ async fn open_project_dialog() -> Option<String> {
     tauri::api::dialog::blocking::FileDialogBuilder::new()
         .set_title("Open Project Folder")
         .pick_folder()
-        .and_then(|p| p.canonicalize().ok())
-        .map(|p| p.display().to_string())
+        .and_then(|p| dunce::canonicalize(&p).ok().or_else(|| p.canonicalize().ok()))
+        .map(|p| clean_unc_path(&p.to_string_lossy()))
 }
 
 /// Walk + parse + build the graph for a workspace, refresh its
 /// SQLite database, and return the graph.
 #[tauri::command]
 async fn index_and_load_graph(root: String, app_handle: tauri::AppHandle) -> Result<Graph, String> {
-    let root = PathBuf::from(&root)
-        .canonicalize()
-        .map_err(|e| format!("cannot open {root}: {e}"))?;
+    let clean_root = clean_unc_path(&root);
+    let root_path = PathBuf::from(&clean_root);
+    let root = dunce::canonicalize(&root_path)
+        .or_else(|_| root_path.canonicalize())
+        .unwrap_or(root_path);
     let summary = repo_graph::indexer::index_repo(&root, Some(&app_handle)).map_err(|e| e.to_string())?;
     // Playbook §28: drop the agent scaffolding into the workspace on first
     // index. Advisory — a read-only checkout or a permissions failure must not
     // fail the index that the user actually asked for.
     if let Err(e) = agent_scaffold::ensure_agent_scaffold(&root) {
         eprintln!("[scaffold] skipped for {}: {e}", root.display());
+    }
+    if let Err(e) = repo_graph::rule_injector::ensure_workspace_rules(&root) {
+        eprintln!("[rule_injector] skipped for {}: {e}", root.display());
     }
     write_active_project_registry(&root);
     repo_graph::watcher::start_watcher(app_handle, root.clone());
@@ -403,7 +479,7 @@ async fn index_and_load_graph(root: String, app_handle: tauri::AppHandle) -> Res
         .max_by_key(|&(_, count)| count)
         .map(|(lang, _)| lang)
         .unwrap_or_else(|| "unknown".to_string());
-    let root_str = root.to_string_lossy().to_string();
+    let root_str = clean_unc_path(&root.to_string_lossy());
     let _ = add_recent_project(root_str, graph.nodes.len() as i64, symbol_count, primary_lang);
     
     Ok(graph)
@@ -413,9 +489,12 @@ async fn index_and_load_graph(root: String, app_handle: tauri::AppHandle) -> Res
 /// recursion confined to the given root.
 #[tauri::command]
 async fn read_directory_tree(root: String) -> Result<Vec<FileTreeNode>, String> {
-    let root = PathBuf::from(&root)
-        .canonicalize()
-        .map_err(|e| format!("cannot open {root}: {e}"))?;
+    let clean_root = clean_unc_path(&root);
+    let root_path = PathBuf::from(&clean_root);
+    let root = dunce::canonicalize(&root_path)
+        .or_else(|_| root_path.canonicalize())
+        .unwrap_or(root_path);
+    write_active_project_registry(&root);
     repo_graph::tree::read_directory_tree(&root).map_err(|e| e.to_string())
 }
 
@@ -631,7 +710,9 @@ fn search_symbols(query: String) -> Result<Vec<SymbolSearchResult>, String> {
             Ok(SymbolSearchResult {
                 name: row.get(0)?,
                 file_path: row.get(1)?,
-                content: row.get(2)?,
+                signature: None,
+                snippet: None,
+                content: row.get(2).ok(),
             })
         })
         .map_err(|e| e.to_string())?;
@@ -832,6 +913,18 @@ fn get_git_status(root: String) -> Result<Vec<GitFileStatus>, String> {
     Ok(results)
 }
 
+#[tauri::command]
+fn ensure_workspace_rules(root: String) -> Result<Vec<String>, String> {
+    let clean = clean_unc_path(&root);
+    let root_path = PathBuf::from(&clean);
+    let canonical = dunce::canonicalize(&root_path)
+        .or_else(|_| root_path.canonicalize())
+        .unwrap_or(root_path);
+    repo_graph::rule_injector::ensure_workspace_rules(&canonical)
+        .map(|paths| paths.into_iter().map(|p| p.to_string_lossy().to_string()).collect())
+        .map_err(|e| e.to_string())
+}
+
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -853,12 +946,17 @@ fn main() {
             trigger_agent_scaffold,
             get_mcp_config_snippet,
             get_domains,
-            get_git_status
+            get_git_status,
+            ensure_workspace_rules,
+            get_file_skeleton,
+            get_execution_trace
         ])
         .setup(|app| {
             let app_handle = app.handle();
             std::thread::spawn(move || {
                 let mut last_id = 0;
+                let mut current_polled_root: Option<PathBuf> = None;
+
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(150));
                     let root = match find_repo_root() {
@@ -869,23 +967,65 @@ fn main() {
                     if !db_path.exists() {
                         continue;
                     }
+
+                    if current_polled_root.as_ref() != Some(&root) {
+                        current_polled_root = Some(root.clone());
+                        if let Ok(conn) = repo_graph::db::init_db(&db_path) {
+                            if let Ok(mut stmt) = conn.prepare("SELECT COALESCE(MAX(id), 0) FROM agent_queries") {
+                                if let Ok(max_id) = stmt.query_row([], |r| r.get::<_, i64>(0)) {
+                                    last_id = max_id;
+                                }
+                            }
+                        }
+                    }
+
                     if let Ok(conn) = repo_graph::db::init_db(&db_path) {
-                        let mut stmt = match conn.prepare("SELECT id, symbol, path, action FROM agent_queries WHERE id > ? ORDER BY id ASC") {
+                        let mut stmt = match conn.prepare("SELECT id, symbol, path, action, input_tokens, output_tokens, raw_tokens, saved_tokens, execution_ms, turn_id, timestamp FROM agent_queries WHERE id > ? ORDER BY id ASC") {
                             Ok(s) => s,
                             Err(_) => continue,
                         };
                         let rows = stmt.query_map([last_id], |row| {
-                            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, i64>(4).unwrap_or(0),
+                                row.get::<_, i64>(5).unwrap_or(0),
+                                row.get::<_, i64>(6).unwrap_or(0),
+                                row.get::<_, i64>(7).unwrap_or(0),
+                                row.get::<_, i64>(8).unwrap_or(0),
+                                row.get::<_, i64>(9).unwrap_or(1),
+                                row.get::<_, Option<i64>>(10).unwrap_or(None),
+                            ))
                         });
                         if let Ok(rows) = rows {
-                            for (id, symbol, path, action) in rows.flatten() {
+                            for (id, symbol, path, action, in_tok, out_tok, raw_tok, saved_tok, exec_ms, turn_id, ts) in rows.flatten() {
                                 last_id = id;
+                                let compression_ratio = if out_tok > 0 && raw_tok > 0 {
+                                    (raw_tok as f32 / out_tok as f32).max(1.0)
+                                } else if saved_tok > 0 {
+                                    18.5
+                                } else {
+                                    1.0
+                                };
                                 let payload = serde_json::json!({
                                     "symbol": symbol,
                                     "path": path,
                                     "action": action,
+                                    "input_tokens": in_tok,
+                                    "output_tokens": out_tok,
+                                    "used_tokens": in_tok + out_tok,
+                                    "raw_tokens": raw_tok,
+                                    "saved_tokens": saved_tok,
+                                    "execution_ms": exec_ms,
+                                    "turn_id": turn_id,
+                                    "compression_ratio": compression_ratio,
+                                    "timestamp": ts.unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
+                                    "status": "success"
                                 });
-                                let _ = app_handle.emit_all("agent_query_event", payload);
+                                let _ = app_handle.emit_all("agent_query_event", payload.clone());
+                                let _ = app_handle.emit_all("mcp-token-pulse", payload);
                             }
                         }
                     }
@@ -971,5 +1111,12 @@ mod scaffold_command_tests {
         assert_eq!(std::fs::read_to_string(&rules).unwrap(), "# mine\n");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_clean_unc_path_normalizes_and_strips() {
+        assert_eq!(clean_unc_path(r"//?/C:/My-pro/innovexinfo/frontend"), "C:/My-pro/innovexinfo/frontend");
+        assert_eq!(clean_unc_path(r"\\?\C:\My-pro\innovexinfo\frontend"), "C:/My-pro/innovexinfo/frontend");
+        assert_eq!(clean_unc_path(r"C:\My-pro\innovexinfo\frontend"), "C:/My-pro/innovexinfo/frontend");
     }
 }

@@ -1,6 +1,27 @@
 import type { FileTreeNode } from '../types'
 
 /**
+ * Strips Windows extended-length UNC path prefixes (e.g. `//?/`, `\\?\`)
+ * and normalizes all separators to clean forward slashes.
+ */
+export function cleanUncPath(path: string | null | undefined): string {
+  if (!path) return ''
+  let cleaned = path.replace(/\\/g, '/')
+  while (
+    cleaned.startsWith('//?/') ||
+    cleaned.startsWith('\\\\?\\') ||
+    cleaned.startsWith('//?\\') ||
+    cleaned.startsWith('\\\\?/')
+  ) {
+    cleaned = cleaned.slice(4)
+  }
+  while (cleaned.startsWith('//?') || cleaned.startsWith('\\\\?')) {
+    cleaned = cleaned.slice(3)
+  }
+  return cleaned
+}
+
+/**
  * Browser fallback for the explorer: derive a directory tree from the
  * indexed graph's file paths when the native `read_directory_tree` IPC
  * command isn't available. Folders first, then files, alphabetical.

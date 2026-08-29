@@ -2,7 +2,7 @@ import { create } from 'zustand'
 import Fuse from 'fuse.js'
 import type { FileTreeNode, GraphNode, RepoGraph, SyncStatus, AgentActivity, GitFileStatus } from './types'
 import { loadGraph, tauriInvoke } from './lib/loadGraph'
-import { buildTreeFromPaths } from './lib/fileTree'
+import { buildTreeFromPaths, cleanUncPath } from './lib/fileTree'
 import { applyHoverHighlight } from './lib/hoverHighlight'
 import { KNOWN_LANGUAGES } from './lib/layout'
 import { savePersistedGraph, loadPersistedGraph } from './lib/graphCache'
@@ -87,19 +87,51 @@ export function agentActivityTargets(
   graph: RepoGraph | null,
   activity: AgentActivity,
 ): string[] {
-  if (activity.path) {
-    return activity.symbol
-      ? [activity.path, `${activity.path}#${activity.symbol}`]
-      : [activity.path]
+  const targets = new Set<string>()
+
+  let rawPath = activity.path?.trim() || ''
+  let symbol = activity.symbol?.trim() || null
+
+  // If path contains 'file#symbol' notation
+  if (rawPath.includes('#') && !symbol) {
+    const parts = rawPath.split('#')
+    rawPath = parts[0]
+    symbol = parts[1]
   }
-  if (!activity.symbol || !graph) return []
-  const targets: string[] = []
-  for (const node of graph.nodes) {
-    if (node.symbols.some((s) => s.name === activity.symbol)) {
-      targets.push(node.path, `${node.path}#${activity.symbol}`)
+
+  const normPath = rawPath
+    .replace(/\\/g, '/')
+    .replace(/^\.?\//, '')
+    .trim()
+
+  if (normPath) {
+    targets.add(normPath)
+    if (symbol) {
+      targets.add(`${normPath}#${symbol}`)
+    }
+    // Also check against graph nodes for exact or relative suffix match
+    if (graph) {
+      for (const node of graph.nodes) {
+        if (node.path === normPath || node.path.endsWith(`/${normPath}`) || normPath.endsWith(`/${node.path}`)) {
+          targets.add(node.path)
+          if (symbol) {
+            targets.add(`${node.path}#${symbol}`)
+          }
+        }
+      }
     }
   }
-  return targets
+
+  if (symbol && graph) {
+    for (const node of graph.nodes) {
+      if (node.symbols.some((s) => s.name === symbol)) {
+        targets.add(node.path)
+        targets.add(`${node.path}#${symbol}`)
+      }
+    }
+  }
+
+  return Array.from(targets)
 }
 
 /**
@@ -197,6 +229,7 @@ interface GraphState {
   clearAgentActivity: () => void
 
   load: () => Promise<void>
+  resetGraphState: () => void
   openProject: () => Promise<void>
   selectProject: (root: string) => Promise<void>
   focusNode: (path: string) => void
@@ -324,13 +357,72 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     }
   },
 
+  resetGraphState: () => {
+    resetIndexProgressTracking()
+    fuse = null
+    set({
+      graph: null,
+      status: 'stale',
+      fileTree: [],
+      activeProjectRoot: null,
+      selected: EMPTY,
+      hoveredPath: null,
+      impactSource: null,
+      impactSet: EMPTY,
+      contextFiles: EMPTY,
+      contextSymbols: EMPTY,
+      searchQuery: '',
+      searchMatches: EMPTY,
+      collapsedDirs: EMPTY,
+      readFiles: EMPTY,
+      expandedFiles: EMPTY,
+      selectedSymbol: null,
+      gitStatus: new Map(),
+      activeAgentTargets: new Set(),
+      dependenciesOf: new Map(),
+      dependentsOf: new Map(),
+      neighborsOf: new Map(),
+      loadError: null,
+      isIndexing: false,
+      indexProgress: IDLE_INDEX_PROGRESS,
+    })
+  },
+
   openProject: async () => {
     const invoke = tauriInvoke()
     if (!invoke) return // browser dev build: native dialog unavailable
-    const root = (await invoke('open_project_dialog')) as string | null
-    if (!root) return // user cancelled
+    const rawRoot = (await invoke('open_project_dialog')) as string | null
+    if (!rawRoot) return // user cancelled
+    const root = cleanUncPath(rawRoot)
     resetIndexProgressTracking()
-    set({ isIndexing: true, status: 'indexing', loadError: null, indexProgress: IDLE_INDEX_PROGRESS })
+    fuse = null
+    // Atomically clear previous graph and node state immediately
+    set({
+      graph: null,
+      fileTree: [],
+      activeProjectRoot: root,
+      selected: EMPTY,
+      hoveredPath: null,
+      impactSource: null,
+      impactSet: EMPTY,
+      contextFiles: EMPTY,
+      contextSymbols: EMPTY,
+      searchQuery: '',
+      searchMatches: EMPTY,
+      collapsedDirs: EMPTY,
+      readFiles: EMPTY,
+      expandedFiles: EMPTY,
+      selectedSymbol: null,
+      gitStatus: new Map(),
+      activeAgentTargets: new Set(),
+      dependenciesOf: new Map(),
+      dependentsOf: new Map(),
+      neighborsOf: new Map(),
+      isIndexing: true,
+      status: 'indexing',
+      loadError: null,
+      indexProgress: IDLE_INDEX_PROGRESS,
+    })
     try {
       const started = performance.now()
       const graph = (await invoke('index_and_load_graph', { root })) as RepoGraph
@@ -356,6 +448,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
         expandedFiles: EMPTY,
         selectedSymbol: null,
       })
+      void get().refreshGitStatus()
     } catch (e) {
       set({
         isIndexing: false,
@@ -366,11 +459,39 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     }
   },
 
-  selectProject: async (root: string) => {
+  selectProject: async (rawRoot: string) => {
     const invoke = tauriInvoke()
     if (!invoke) return
+    const root = cleanUncPath(rawRoot)
     resetIndexProgressTracking()
-    set({ isIndexing: true, status: 'indexing', loadError: null, indexProgress: IDLE_INDEX_PROGRESS })
+    fuse = null
+    // Atomically clear previous graph and node state immediately
+    set({
+      graph: null,
+      fileTree: [],
+      activeProjectRoot: root,
+      selected: EMPTY,
+      hoveredPath: null,
+      impactSource: null,
+      impactSet: EMPTY,
+      contextFiles: EMPTY,
+      contextSymbols: EMPTY,
+      searchQuery: '',
+      searchMatches: EMPTY,
+      collapsedDirs: EMPTY,
+      readFiles: EMPTY,
+      expandedFiles: EMPTY,
+      selectedSymbol: null,
+      gitStatus: new Map(),
+      activeAgentTargets: new Set(),
+      dependenciesOf: new Map(),
+      dependentsOf: new Map(),
+      neighborsOf: new Map(),
+      isIndexing: true,
+      status: 'indexing',
+      loadError: null,
+      indexProgress: IDLE_INDEX_PROGRESS,
+    })
     try {
       const started = performance.now()
       const graph = (await invoke('index_and_load_graph', { root })) as RepoGraph

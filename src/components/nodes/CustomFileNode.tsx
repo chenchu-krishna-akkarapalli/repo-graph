@@ -8,10 +8,10 @@ import type { FileNodeData } from '../../lib/layout'
 const CORE_RANK = 0.5
 
 const LANGUAGE_CLASSES: Record<string, string> = {
-  javascript: 'bg-[#0E1726]/90 border-blue-500/40 hover:border-blue-400',
-  python: 'bg-[#0B1E16]/90 border-emerald-500/40 hover:border-emerald-400',
-  rust: 'bg-[#22130B]/90 border-orange-500/40 hover:border-orange-400',
-  other: 'bg-[#10141D]/90 border-white/10 hover:border-white/25',
+  javascript: 'bg-[#0E1726]/60 border-blue-500/30 hover:border-blue-400/80 shadow-lg shadow-black/40 backdrop-blur-xl',
+  python: 'bg-[#0B1E16]/60 border-emerald-500/30 hover:border-emerald-400/80 shadow-lg shadow-black/40 backdrop-blur-xl',
+  rust: 'bg-[#22130B]/60 border-orange-500/30 hover:border-orange-400/80 shadow-lg shadow-black/40 backdrop-blur-xl',
+  other: 'bg-[#10141D]/60 border-white/10 hover:border-white/25 shadow-lg shadow-black/40 backdrop-blur-xl',
 }
 
 function CustomFileNode({ id, data, selected }: NodeProps<FileNodeData>) {

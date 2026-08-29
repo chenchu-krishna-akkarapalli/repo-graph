@@ -88,27 +88,65 @@ pub struct ParsedFile {
 /// against the indexed file set (false negatives over false positives),
 /// split externals out of the edge set, compute degrees.
 pub fn load_tsconfig_aliases(root: &Path) -> HashMap<String, Vec<String>> {
-    let tsconfig_path = root.join("tsconfig.json");
-    if !tsconfig_path.exists() {
-        return HashMap::new();
-    }
-    let content = match std::fs::read_to_string(&tsconfig_path) {
-        Ok(c) => c,
-        Err(_) => return HashMap::new(),
-    };
-    let cleaned = clean_json_comments(&content);
-    let parsed: Result<serde_json::Value, _> = serde_json::from_str(&cleaned);
     let mut aliases = HashMap::new();
-    if let Ok(val) = parsed {
-        if let Some(paths) = val.get("compilerOptions").and_then(|co| co.get("paths")).and_then(|p| p.as_object()) {
-            for (k, v) in paths {
-                if let Some(arr) = v.as_array() {
-                    let mapped_paths: Vec<String> = arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
-                    aliases.insert(k.clone(), mapped_paths);
+
+    // Check tsconfig.json, then fallback to jsconfig.json
+    for filename in ["tsconfig.json", "jsconfig.json"] {
+        let config_path = root.join(filename);
+        if !config_path.exists() {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&config_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let cleaned = clean_json_comments(&content);
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(&cleaned);
+        if let Ok(val) = parsed {
+            if let Some(co) = val.get("compilerOptions") {
+                if let Some(paths) = co.get("paths").and_then(|p| p.as_object()) {
+                    for (k, v) in paths {
+                        if let Some(arr) = v.as_array() {
+                            let mapped_paths: Vec<String> = arr
+                                .iter()
+                                .filter_map(|x| x.as_str().map(|s| s.replace('\\', "/")))
+                                .collect();
+                            aliases.insert(k.clone(), mapped_paths);
+                        }
+                    }
+                }
+
+                // Handle baseUrl if paths did not specify anything
+                if let Some(base_url) = co.get("baseUrl").and_then(|b| b.as_str()) {
+                    let clean_base = base_url.trim_matches(['.', '/', '\\']);
+                    if !clean_base.is_empty() {
+                        aliases
+                            .entry("*".to_string())
+                            .or_insert_with(Vec::new)
+                            .push(format!("{clean_base}/*"));
+                    }
                 }
             }
         }
+        if !aliases.is_empty() {
+            break;
+        }
     }
+
+    // Default Next.js convention aliases if not explicitly specified
+    if !aliases.contains_key("@/*") {
+        aliases.insert(
+            "@/*".to_string(),
+            vec!["src/*".to_string(), "./*".to_string(), "*".to_string()],
+        );
+    }
+    if !aliases.contains_key("~/*") {
+        aliases.insert(
+            "~/*".to_string(),
+            vec!["src/*".to_string(), "./*".to_string(), "*".to_string()],
+        );
+    }
+
     aliases
 }
 
@@ -145,22 +183,26 @@ fn clean_json_comments(s: &str) -> String {
 
 pub fn resolve_tsconfig_alias(aliases: &HashMap<String, Vec<String>>, stem: &str) -> Vec<String> {
     let mut candidates = Vec::new();
+    let normalized_stem = stem.replace('\\', "/");
+
     for (pattern, targets) in aliases {
         if pattern.ends_with('*') {
             let prefix = &pattern[..pattern.len() - 1];
-            if let Some(wildcard) = stem.strip_prefix(prefix) {
+            if let Some(wildcard) = normalized_stem.strip_prefix(prefix) {
                 for target in targets {
-                    if target.ends_with('*') {
-                        let target_prefix = &target[..target.len() - 1];
+                    let clean_target = target.trim_start_matches("./").replace('\\', "/");
+                    if clean_target.ends_with('*') {
+                        let target_prefix = &clean_target[..clean_target.len() - 1];
                         candidates.push(format!("{}{}", target_prefix, wildcard));
                     } else {
-                        candidates.push(target.clone());
+                        candidates.push(clean_target);
                     }
                 }
             }
-        } else if pattern == stem {
+        } else if pattern == &normalized_stem {
             for target in targets {
-                candidates.push(target.clone());
+                let clean_target = target.trim_start_matches("./").replace('\\', "/");
+                candidates.push(clean_target);
             }
         }
     }
@@ -191,17 +233,22 @@ pub fn build_graph(parsed: Vec<ParsedFile>, aliases: &HashMap<String, Vec<String
         exports.dedup();
 
         for import in &p.extraction.imports {
-            let resolved = import.resolved_path.as_deref().and_then(|stem| {
-                let mut stems = vec![stem.to_string()];
-                let mapped = resolve_tsconfig_alias(aliases, stem);
+            let resolved = {
+                let mut stems = Vec::new();
+                if let Some(stem) = &import.resolved_path {
+                    stems.push(stem.clone());
+                }
+                stems.push(import.raw_specifier.clone());
+                let mapped = resolve_tsconfig_alias(aliases, &import.raw_specifier);
                 stems.extend(mapped);
 
                 stems.iter().find_map(|s| {
-                    resolve_candidates(&p.entry.language, s)
+                    let clean = s.trim_start_matches("./").trim_start_matches('/').replace('\\', "/");
+                    resolve_candidates(&p.entry.language, &clean)
                         .into_iter()
                         .find(|c| file_set.contains(c))
                 })
-            });
+            };
             match resolved {
                 Some(target) => {
                     if target != *path {

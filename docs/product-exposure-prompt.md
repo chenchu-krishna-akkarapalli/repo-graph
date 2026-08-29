@@ -98,11 +98,20 @@ This workspace is indexed by the Repo Graph local MCP server.
 4. READ BEFORE WRITE: Never edit code based purely on a signature header; expand symbol bodies with `repograph_explore` prior to code generation.
 5. SCRATCHPAD MANAGEMENT: Maintain intermediate progress in an external runtime scratchpad (`memory/runtime/context.md`), keeping conversation turns lean.
 
+## OPTIMIZED TOOL QUERY STRATEGY & TOKEN TARGETS
+
+| Tool Method | Token Usage | Target Use Case |
+| :--- | :--- | :--- |
+| `repograph_explore(symbols: ["PageShell"], signature_only: true)` | **~800 tokens** (92% savings) | Retrieve full call graph, callers, and signatures. |
+| `repograph_callers(symbol: "PageShell")` | **~300 tokens** | Find exact list of calling components without code bodies. |
+| `repograph_node(path: "app/components/page-shell.tsx")` | **~200 tokens** | Read exact single-file definition. |
+| `repograph_search(query: "PageShell", limit: 5)` | **~400 tokens** | Paginated symbol definition locator with 3-line snippets. |
+
 ## 4-STEP DISCOVERY PROTOCOL
 - STEP 1 (ORIENT): Execute `repograph_status()` to verify index state, then `repograph_files(scope: "<path>")` to retrieve the compressed manifest map.
-- STEP 2 (TARGET): Execute `repograph_search(query: "<symbol>")` to locate symbol definitions across the codebase.
-- STEP 3 (EXPLORE): Call `repograph_explore(symbols: ["<symbol>"], signature_only: true)` to analyze AST signatures and call graphs.
-- STEP 4 (IMPLEMENT): Call `repograph_explore(symbols: ["<symbol>"])` with full bodies loaded only for symbols you are modifying.
+- STEP 2 (TARGET): Execute `repograph_search(query: "<symbol>", limit: 5)` to locate symbol definitions across the codebase with minimal token footprint.
+- STEP 3 (EXPLORE): Call `repograph_explore(symbols: ["<symbol>"], signature_only: true)` or `repograph_callers(symbol: "<symbol>")` to analyze AST signatures and call graphs without dumping function bodies.
+- STEP 4 (IMPLEMENT): Call `repograph_explore(symbols: ["<symbol>"])` or `repograph_node(path: "<path>")` with full bodies loaded only for symbols you are actively modifying.
 
 ## CONTEXT STACK FORMAT FOR TURNS
 [INSTRUCTIONS] -> System rules & guardrails

@@ -70,6 +70,10 @@ pub fn index_repo(root: &Path, app_handle: Option<&tauri::AppHandle>) -> Result<
         .canonicalize()
         .map_err(|e| format!("cannot open repo root {}: {e}", root.display()))?;
 
+    // Drop agent scaffolding and workspace rules into any indexed repository
+    let _ = crate::agent_scaffold::ensure_agent_scaffold(&root);
+    let _ = crate::rule_injector::ensure_workspace_rules(&root);
+
     emit_progress(app_handle, "walking", 0, 0, 0, 0);
     let files = walk_repo(&root);
     let files_total = files.len();

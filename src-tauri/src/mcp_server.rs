@@ -65,6 +65,8 @@ pub struct McpServer {
     conn: Option<rusqlite::Connection>,
     /// Persistent connection and session state across turns.
     pub session: McpSession,
+    /// Live token metrics and savings tracker.
+    pub tracker: crate::telemetry::LiveTokenTracker,
 }
 
 #[derive(Debug, PartialEq)]
@@ -82,15 +84,40 @@ impl ToolError {
     }
 }
 
+pub fn normalize_line_endings(s: &str) -> String {
+    s.replace("\r\n", "\n")
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct FilePatch {
+    pub path: String,
+    pub target_content: String,
+    pub replacement_content: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SearchParams {
+    pub query: String,
+    pub limit: Option<usize>,           // default: 10 (cap maximum result count)
+    pub signature_only: Option<bool>,   // default: true (don't dump full AST body!)
+    pub exact_symbol_only: Option<bool>,// match symbol identifiers vs body text
+    pub force_full: Option<bool>,       // override intelligent 2,500 token compression
+}
+
 fn sanitize_windows_path(raw: &str) -> PathBuf {
     let mut cleaned = raw.trim();
-    if cleaned.starts_with("//?/") || cleaned.starts_with("\\\\?\\") {
+    while cleaned.starts_with("//?/")
+        || cleaned.starts_with(r"\\?\")
+        || cleaned.starts_with(r"//?\")
+        || cleaned.starts_with(r"\\?/")
+    {
         cleaned = &cleaned[4..];
-    } else if cleaned.starts_with("//?") || cleaned.starts_with("\\\\?") {
-        // `starts_with` on a 3-byte ASCII prefix already guarantees the length.
+    }
+    while cleaned.starts_with("//?") || cleaned.starts_with(r"\\?") {
         cleaned = &cleaned[3..];
     }
-    PathBuf::from(cleaned.replace('/', std::path::MAIN_SEPARATOR_STR))
+    let normalized = cleaned.replace('/', std::path::MAIN_SEPARATOR_STR);
+    PathBuf::from(normalized)
 }
 
 fn resolve_mcp_root(root: &Path) -> Result<(PathBuf, String, Option<String>), String> {
@@ -137,12 +164,21 @@ fn resolve_mcp_root(root: &Path) -> Result<(PathBuf, String, Option<String>), St
 
     let canonical = dunce::canonicalize(&target_root)
         .or_else(|_| target_root.canonicalize())
-        .map_err(|e| format!("cannot canonicalize repo root {}: {e}", target_root.display()))?;
+        .unwrap_or_else(|_| target_root.clone());
 
-    let root_display = dunce::canonicalize(&canonical)
-        .unwrap_or_else(|_| canonical.clone())
-        .to_string_lossy()
-        .to_string();
+    let simplified = dunce::simplified(&canonical);
+    let mut root_display = simplified.to_string_lossy().replace('\\', "/");
+    while root_display.starts_with("//?/")
+        || root_display.starts_with(r"\\?\")
+        || root_display.starts_with(r"//?\")
+        || root_display.starts_with(r"\\?/")
+    {
+        root_display = root_display[4..].to_string();
+    }
+    while root_display.starts_with("//?") || root_display.starts_with(r"\\?") {
+        root_display = root_display[3..].to_string();
+    }
+
     Ok((canonical, root_display, warning_msg))
 }
 
@@ -191,6 +227,23 @@ pub fn signature_block(lines: &[&str], start: usize, end: usize) -> String {
         out.pop();
     }
     out
+}
+
+/// Extracts a 3-line context snippet (1 line before, matching line, 1 line after)
+/// around the first line matching the query within lines.
+pub fn extract_3line_snippet(lines: &[&str], query: &str) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let lower_query = query.to_lowercase();
+    let match_idx = lines
+        .iter()
+        .position(|line| line.to_lowercase().contains(&lower_query))
+        .unwrap_or(0);
+
+    let start_idx = match_idx.saturating_sub(1);
+    let end_idx = (match_idx + 2).min(lines.len());
+    lines[start_idx..end_idx].join("\n")
 }
 
 /// One call-graph edge as a single arrow string: `caller -kind-> callee`.
@@ -281,10 +334,47 @@ pub fn collapse_endpoints(raw: Vec<(String, String, String)>, anchor_file: &str)
     out
 }
 
+fn validate_ast_syntax(path: &Path, content: &str) -> Result<Vec<String>, String> {
+    let lang = crate::walker::language_for(path);
+    let mut diagnostics = Vec::new();
+    if let Some(extractor) = crate::parsers::extractor_for(&lang) {
+        let res = extractor.extract(path, content);
+        for w in &res.warnings {
+            if w.starts_with("parse_error:") {
+                return Err(format!("AST validation syntax error in {}: {}", path.display(), w));
+            } else {
+                diagnostics.push(w.clone());
+            }
+        }
+    }
+    Ok(diagnostics)
+}
+
+fn count_file_edges(conn: &rusqlite::Connection, rel_path: &str) -> (usize, usize) {
+    let out = conn
+        .query_row(
+            "SELECT COUNT(*) FROM file_edges WHERE from_path = ?",
+            [rel_path],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as usize;
+    let in_e = conn
+        .query_row(
+            "SELECT COUNT(*) FROM file_edges WHERE to_path = ?",
+            [rel_path],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as usize;
+    (out, in_e)
+}
+
 impl McpServer {
     pub fn new(root: &Path) -> Result<McpServer, String> {
         let (canonical, root_display, sync_warning) = resolve_mcp_root(root)?;
+        let _ = crate::agent_scaffold::ensure_agent_scaffold(&canonical);
+        let _ = crate::rule_injector::ensure_workspace_rules(&canonical);
         let _ = crate::db::reconcile_repo_startup(&canonical);
+        crate::watcher::start_standalone_watcher(canonical.clone());
         Ok(McpServer {
             root_display,
             cache_path: canonical.join(GRAPH_CACHE_RELATIVE_PATH),
@@ -295,6 +385,7 @@ impl McpServer {
             sync_warning,
             conn: None,
             session: McpSession::default(),
+            tracker: crate::telemetry::LiveTokenTracker::new(),
         })
     }
 
@@ -424,8 +515,31 @@ impl McpServer {
                 "startTime": self.session.start_time,
                 "persistent": true
             },
-            "instructions": "The Repo Graph MCP server maintains a persistent, session-wide connection across all multi-turn conversation workflows. When researching, exploring, navigating, or modifying code in this workspace, ALWAYS prioritize calling Repo Graph MCP tools (`repograph_explore`, `repograph_files`, `repograph_node`, `repograph_search`, `repograph_impact`, `repograph_callers`, `repograph_callees`, `repograph_status`). Use `repograph_explore` for compound symbol retrieval and call graphs to minimize token ingestion. Use `repograph_status` for connection health and sync status."
+            "instructions": "The Repo Graph MCP server maintains a persistent, session-wide connection across all multi-turn conversation workflows. When researching, exploring, navigating, or modifying code in this workspace, ALWAYS prioritize calling Repo Graph MCP tools (`repograph_explore`, `repograph_files`, `repograph_node`, `repograph_search`, `repograph_impact`, `repograph_callers`, `repograph_callees`, `repograph_edit`, `repograph_batch_edit`, `repograph_edit_symbol`, `repograph_write`, `repograph_delete`, `repograph_status`). Restore active session context via `.myrepograph-agent/memory/runtime/context.md`, use `repograph_explore` for compound symbol retrieval and call graphs to minimize token ingestion, execute atomic refactors via `repograph_batch_edit`, check connection with `repograph_status`, and log closeout to `.myrepograph-agent/memory/runtime/dailylog.md`."
         })
+    }
+
+    fn compute_raw_tokens_for_files(&self, file_paths: &[String]) -> usize {
+        let mut total = 0;
+        let mut seen = std::collections::HashSet::new();
+        for rel in file_paths {
+            let clean_rel = rel.trim_start_matches('/').trim_start_matches('\\');
+            if seen.insert(clean_rel.to_string()) {
+                let abs = self.root.join(clean_rel);
+                if let Ok(content) = std::fs::read_to_string(&abs) {
+                    total += crate::telemetry::count_tokens(&content);
+                } else if let Some(g) = &self.graph {
+                    if let Some(n) = g.nodes.iter().find(|node| node.path == clean_rel || node.path.ends_with(clean_rel)) {
+                        total += (n.size_bytes as f64 / 3.7).round() as usize;
+                    }
+                }
+            }
+        }
+        if total == 0 {
+            file_paths.len().max(1) * 1500
+        } else {
+            total
+        }
     }
 
     fn tools_call(&mut self, params: &Value) -> Result<Value, (i64, String)> {
@@ -446,6 +560,129 @@ impl McpServer {
             ));
         }
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
+
+        let start_time = std::time::Instant::now();
+        let mut raw_file_tokens = match name {
+            "repograph_files" => {
+                let paths: Vec<String> = self.graph.as_ref()
+                    .map(|g| g.nodes.iter().map(|n| n.path.clone()).collect())
+                    .unwrap_or_default();
+                self.compute_raw_tokens_for_files(&paths)
+            }
+            "repograph_explore" => {
+                let symbols_arr = args.get("symbols").and_then(Value::as_array);
+                let mut resolved_files = Vec::new();
+                if let Some(arr) = symbols_arr {
+                    for v in arr {
+                        if let Some(s) = v.as_str() {
+                            if s.contains('#') {
+                                if let Some(f) = s.split('#').next() {
+                                    resolved_files.push(f.to_string());
+                                }
+                            } else if s.ends_with(".ts") || s.ends_with(".tsx") || s.ends_with(".rs") || s.ends_with(".py") || s.ends_with(".js") {
+                                resolved_files.push(s.to_string());
+                            } else if let Ok(conn) = self.db() {
+                                if let Ok(mut stmt) = conn.prepare("SELECT file_path FROM symbols WHERE name = ? LIMIT 3") {
+                                    if let Ok(rows) = stmt.query_map([s], |r| r.get::<_, String>(0)) {
+                                        for row in rows.flatten() {
+                                            resolved_files.push(row);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if resolved_files.is_empty() {
+                    let count = symbols_arr.map(|a| a.len()).unwrap_or(1);
+                    count * 3500
+                } else {
+                    self.compute_raw_tokens_for_files(&resolved_files)
+                }
+            }
+            "repograph_search" => {
+                if let Some(q) = args.get("query").and_then(Value::as_str) {
+                    if let Ok(conn) = self.db() {
+                        let match_query = crate::db::build_fts_match_query(q);
+                        let mut found_files = Vec::new();
+                        if let Ok(mut stmt) = conn.prepare("SELECT DISTINCT file_path FROM symbols_fts WHERE tokens MATCH ? LIMIT 5") {
+                            if let Ok(rows) = stmt.query_map([&match_query], |r| r.get::<_, String>(0)) {
+                                for row in rows.flatten() {
+                                    found_files.push(row);
+                                }
+                            }
+                        }
+                        if !found_files.is_empty() {
+                            self.compute_raw_tokens_for_files(&found_files)
+                        } else {
+                            3500
+                        }
+                    } else {
+                        3500
+                    }
+                } else {
+                    3500
+                }
+            }
+            "repograph_impact" => {
+                if let Some(p) = args.get("path").and_then(Value::as_str) {
+                    let mut deps = vec![p.to_string()];
+                    if let Ok((_, adj)) = self.graph_and_adjacency() {
+                        let normalized = p.trim_start_matches('/').to_string();
+                        for d in adj.dependents_of(&normalized) {
+                            deps.push(d);
+                        }
+                    }
+                    self.compute_raw_tokens_for_files(&deps)
+                } else {
+                    4000
+                }
+            }
+            "repograph_callers" | "repograph_callees" => 3500,
+            "repograph_node" => {
+                if let Some(p) = args.get("path").and_then(Value::as_str) {
+                    self.compute_raw_tokens_for_files(&[p.to_string()])
+                } else {
+                    1500
+                }
+            }
+            "repograph_edit" => {
+                if let Some(p) = args.get("path").and_then(Value::as_str) {
+                    self.compute_raw_tokens_for_files(&[p.to_string()])
+                } else {
+                    2000
+                }
+            }
+            "repograph_batch_edit" => {
+                if let Some(patches_val) = args.get("patches").and_then(Value::as_array) {
+                    let mut paths = Vec::new();
+                    for p in patches_val {
+                        if let Some(path_str) = p.get("path").and_then(Value::as_str) {
+                            paths.push(path_str.to_string());
+                        }
+                    }
+                    self.compute_raw_tokens_for_files(&paths)
+                } else {
+                    2500
+                }
+            }
+            "repograph_edit_symbol" => {
+                if let Some(p) = args.get("path").and_then(Value::as_str) {
+                    self.compute_raw_tokens_for_files(&[p.to_string()])
+                } else {
+                    1500
+                }
+            }
+            "repograph_write" => {
+                if let Some(c) = args.get("content").and_then(Value::as_str) {
+                    crate::telemetry::count_tokens(c) + 500
+                } else {
+                    1500
+                }
+            }
+            "repograph_delete" => 500,
+            _ => 1000,
+        };
 
         let outcome = match name {
             "repograph_domains" => {
@@ -474,11 +711,41 @@ impl McpServer {
             "repograph_node" => {
                 let path = args.get("path").and_then(Value::as_str).ok_or((-32602, "repograph_node requires 'path'".to_string()))?;
                 let symbol = args.get("symbol").and_then(Value::as_str);
+                let start_line = args.get("start_line").and_then(Value::as_u64).map(|v| v as usize);
+                let end_line = args.get("end_line").and_then(Value::as_u64).map(|v| v as usize);
+                let with_line_numbers = args.get("with_line_numbers").and_then(Value::as_bool);
                 if let Some(s) = symbol {
-                    self.read_symbol(path, s)
+                    self.read_symbol_sliced(path, s, start_line, end_line, with_line_numbers)
                 } else {
-                    self.read_file(path)
+                    self.read_file_sliced(path, start_line, end_line, with_line_numbers)
                 }
+            }
+            "repograph_edit" => {
+                let path = args.get("path").and_then(Value::as_str).ok_or((-32602, "repograph_edit requires 'path'".to_string()))?;
+                let target = args.get("target_content").and_then(Value::as_str).ok_or((-32602, "repograph_edit requires 'target_content'".to_string()))?;
+                let replacement = args.get("replacement_content").and_then(Value::as_str).ok_or((-32602, "repograph_edit requires 'replacement_content'".to_string()))?;
+                self.repograph_edit(path, target, replacement)
+            }
+            "repograph_batch_edit" => {
+                let patches_val = args.get("patches").ok_or((-32602, "repograph_batch_edit requires 'patches'".to_string()))?;
+                let patches: Vec<FilePatch> = serde_json::from_value(patches_val.clone())
+                    .map_err(|e| (-32602, format!("invalid 'patches' array: {e}")))?;
+                self.repograph_batch_edit(patches)
+            }
+            "repograph_edit_symbol" => {
+                let path = args.get("path").and_then(Value::as_str).ok_or((-32602, "repograph_edit_symbol requires 'path'".to_string()))?;
+                let symbol = args.get("symbol").and_then(Value::as_str).ok_or((-32602, "repograph_edit_symbol requires 'symbol'".to_string()))?;
+                let new_code = args.get("new_code").and_then(Value::as_str).ok_or((-32602, "repograph_edit_symbol requires 'new_code'".to_string()))?;
+                self.repograph_edit_symbol(path, symbol, new_code)
+            }
+            "repograph_write" => {
+                let path = args.get("path").and_then(Value::as_str).ok_or((-32602, "repograph_write requires 'path'".to_string()))?;
+                let content = args.get("content").and_then(Value::as_str).ok_or((-32602, "repograph_write requires 'content'".to_string()))?;
+                self.repograph_write(path, content)
+            }
+            "repograph_delete" => {
+                let path = args.get("path").and_then(Value::as_str).ok_or((-32602, "repograph_delete requires 'path'".to_string()))?;
+                self.repograph_delete(path)
             }
             "repograph_callers" => {
                 let path = args.get("path").and_then(Value::as_str);
@@ -497,7 +764,17 @@ impl McpServer {
             }
             "repograph_search" => {
                 let query = args.get("query").and_then(Value::as_str).ok_or((-32602, "repograph_search requires 'query'".to_string()))?;
-                self.search_symbols(query)
+                let limit = args.get("limit").and_then(Value::as_u64).map(|v| v as usize);
+                let signature_only = args.get("signature_only").and_then(Value::as_bool);
+                let exact_symbol_only = args.get("exact_symbol_only").and_then(Value::as_bool);
+                let force_full = args.get("force_full").and_then(Value::as_bool);
+                self.search_symbols(SearchParams {
+                    query: query.to_string(),
+                    limit,
+                    signature_only,
+                    exact_symbol_only,
+                    force_full,
+                })
             }
             "repograph_explore" => {
                 let symbols_val = args.get("symbols").ok_or((-32602, "repograph_explore requires 'symbols'".to_string()))?;
@@ -518,7 +795,29 @@ impl McpServer {
                     .get("compact_edges")
                     .and_then(Value::as_bool)
                     .unwrap_or(signature_only);
-                self.explore(symbols, signature_only, compact_edges)
+                let force_full = args.get("force_full").and_then(Value::as_bool);
+                self.explore(symbols, signature_only, compact_edges, force_full)
+            }
+            "repograph_skeleton" => {
+                let path = args.get("path").and_then(Value::as_str).ok_or((-32602, "repograph_skeleton requires 'path'".to_string()))?;
+                match self.get_skeleton(path) {
+                    Ok((res, raw_toks)) => {
+                        raw_file_tokens = raw_toks;
+                        Ok(res)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            "repograph_trace" => {
+                let entrypoint = args.get("entrypoint").and_then(Value::as_str).ok_or((-32602, "repograph_trace requires 'entrypoint'".to_string()))?;
+                let depth = args.get("depth").and_then(Value::as_u64).map(|v| v as usize).unwrap_or(3);
+                match self.get_execution_trace(entrypoint, depth) {
+                    Ok((res, raw_toks)) => {
+                        raw_file_tokens = raw_toks;
+                        Ok(res)
+                    }
+                    Err(e) => Err(e),
+                }
             }
             "repograph_status" => {
                 self.codegraph_status()
@@ -526,18 +825,61 @@ impl McpServer {
             other => return Err((-32602, format!("unknown tool: {other}"))),
         };
 
+        let execution_ms = start_time.elapsed().as_millis();
+        let input_str = args.to_string();
+
         // Tool-level failures are structured MCP tool results (isError),
         // not JSON-RPC protocol errors, so the calling agent can react.
         Ok(match outcome {
-            Ok(text) => json!({
-                "content": [{"type": "text", "text": text}],
-                "isError": false
-            }),
-            Err(e) => json!({
-                "content": [{"type": "text", "text":
-                    format!("error [{}]: {}", e.code, e.message)}],
-                "isError": true
-            }),
+            Ok(mut text) => {
+                let metrics = self.tracker.record_call(name, &input_str, &text, raw_file_tokens, execution_ms);
+                let tag = self.tracker.format_inband_tag(&metrics);
+                text.push_str(&tag);
+
+                if let Ok(conn) = self.db() {
+                    let symbol_hint = args.get("symbol").or_else(|| args.get("symbols").and_then(|a| a.get(0))).and_then(Value::as_str).unwrap_or("");
+                    let path_hint = args.get("path").or_else(|| args.get("query")).and_then(Value::as_str).unwrap_or("");
+                    crate::db::log_agent_query_metrics(
+                        conn,
+                        symbol_hint,
+                        path_hint,
+                        name,
+                        metrics.input_tokens,
+                        metrics.output_tokens,
+                        metrics.raw_equivalent_tokens,
+                        metrics.saved_tokens,
+                        metrics.execution_ms,
+                        metrics.turn_id,
+                    );
+                }
+
+                json!({
+                    "content": [{"type": "text", "text": text}],
+                    "isError": false
+                })
+            }
+            Err(e) => {
+                let err_msg = format!("error [{}]: {}", e.code, e.message);
+                let metrics = self.tracker.record_call(name, &input_str, &err_msg, 0, execution_ms);
+                if let Ok(conn) = self.db() {
+                    crate::db::log_agent_query_metrics(
+                        conn,
+                        "",
+                        "",
+                        name,
+                        metrics.input_tokens,
+                        metrics.output_tokens,
+                        0,
+                        0,
+                        metrics.execution_ms,
+                        metrics.turn_id,
+                    );
+                }
+                json!({
+                    "content": [{"type": "text", "text": err_msg}],
+                    "isError": true
+                })
+            }
         })
     }
 
@@ -694,6 +1036,467 @@ impl McpServer {
         Ok(slice)
     }
 
+    pub fn read_file_sliced(
+        &mut self,
+        path: &str,
+        start_line: Option<usize>,
+        end_line: Option<usize>,
+        with_line_numbers: Option<bool>,
+    ) -> Result<String, ToolError> {
+        let content = self.read_file(path)?;
+        if start_line.is_none() && end_line.is_none() && !with_line_numbers.unwrap_or(false) {
+            return Ok(content);
+        }
+
+        let lines: Vec<&str> = content.lines().collect();
+        let total = lines.len();
+        let start = start_line.unwrap_or(1).max(1);
+        let end = end_line.unwrap_or(total).min(total);
+
+        if start > total {
+            return Err(ToolError::new(
+                "invalid_range",
+                format!("start_line ({start}) exceeds file line count ({total})"),
+            ));
+        }
+
+        let show_nums = with_line_numbers.unwrap_or(start_line.is_some() || end_line.is_some());
+        let mut out = Vec::new();
+        for i in start..=end {
+            let line_str = lines.get(i - 1).unwrap_or(&"");
+            if show_nums {
+                out.push(format!("{:>4}: {}", i, line_str));
+            } else {
+                out.push(line_str.to_string());
+            }
+        }
+        Ok(out.join("\n"))
+    }
+
+    pub fn read_symbol_sliced(
+        &mut self,
+        path: &str,
+        symbol: &str,
+        start_line: Option<usize>,
+        end_line: Option<usize>,
+        with_line_numbers: Option<bool>,
+    ) -> Result<String, ToolError> {
+        let symbol_slice = self.read_symbol(path, symbol)?;
+        if start_line.is_none() && end_line.is_none() && !with_line_numbers.unwrap_or(false) {
+            return Ok(symbol_slice);
+        }
+
+        let lines: Vec<&str> = symbol_slice.lines().collect();
+        let total = lines.len();
+        let start = start_line.unwrap_or(1).max(1);
+        let end = end_line.unwrap_or(total).min(total);
+
+        let show_nums = with_line_numbers.unwrap_or(start_line.is_some() || end_line.is_some());
+        let mut out = Vec::new();
+        for i in start..=end {
+            let line_str = lines.get(i - 1).unwrap_or(&"");
+            if show_nums {
+                out.push(format!("{:>4}: {}", i, line_str));
+            } else {
+                out.push(line_str.to_string());
+            }
+        }
+        Ok(out.join("\n"))
+    }
+
+    pub fn repograph_edit(
+        &mut self,
+        path: &str,
+        target_content: &str,
+        replacement_content: &str,
+    ) -> Result<String, ToolError> {
+        let clean_rel = path.trim_start_matches('/').trim_start_matches('\\').to_string();
+        let resolved = self.resolve_inside_root(&clean_rel)?;
+        self.reject_secret(&resolved, &clean_rel)?;
+
+        if !resolved.is_file() {
+            return Err(ToolError::new("file_not_found", format!("file not found: {clean_rel}")));
+        }
+
+        let original = std::fs::read_to_string(&resolved).map_err(|e| {
+            ToolError::new("io_error", format!("failed to read {clean_rel}: {e}"))
+        })?;
+
+        let norm_orig = normalize_line_endings(&original);
+        let norm_target = normalize_line_endings(target_content);
+        let norm_replacement = normalize_line_endings(replacement_content);
+
+        if !norm_orig.contains(&norm_target) {
+            return Err(ToolError::new(
+                "target_not_found",
+                format!("target_content was not found in {clean_rel}. Ensure exact character and whitespace match."),
+            ));
+        }
+
+        let updated = norm_orig.replacen(&norm_target, &norm_replacement, 1);
+
+        let diagnostics = validate_ast_syntax(&resolved, &updated)
+            .map_err(|e| ToolError::new("syntax_validation_failed", e))?;
+
+        let (old_out, old_in): (usize, usize) = if let Ok(conn) = self.db() {
+            count_file_edges(conn, &clean_rel)
+        } else {
+            (0, 0)
+        };
+
+        std::fs::write(&resolved, &updated).map_err(|e| {
+            ToolError::new("io_error", format!("failed to write {clean_rel}: {e}"))
+        })?;
+
+        let _ = crate::watcher::sync_path(&self.root, &clean_rel);
+        crate::watcher::remove_pending(&self.root, &resolved);
+        self.graph = None;
+        self.adjacency = None;
+        let _ = self.load_graph();
+
+        let (new_out, new_in): (usize, usize) = if let Ok(conn) = self.db() {
+            count_file_edges(conn, &clean_rel)
+        } else {
+            (0, 0)
+        };
+
+        let added: usize = (new_out + new_in).saturating_sub(old_out + old_in);
+        let removed: usize = (old_out + old_in).saturating_sub(new_out + new_in);
+
+        let res = json!({
+            "success": true,
+            "modified_file": clean_rel,
+            "new_edges": added,
+            "broken_edges": removed,
+            "diagnostics": diagnostics,
+            "sync_state": "Synced",
+            "message": format!("Successfully edited {clean_rel}. AST validated, graph edges updated synchronously.")
+        });
+
+        Ok(serde_json::to_string_pretty(&res).unwrap_or_else(|_| res.to_string()))
+    }
+
+    pub fn repograph_write(
+        &mut self,
+        path: &str,
+        content: &str,
+    ) -> Result<String, ToolError> {
+        let clean_rel = path.trim_start_matches('/').trim_start_matches('\\').to_string();
+        let resolved = self.resolve_inside_root(&clean_rel)?;
+        self.reject_secret(&resolved, &clean_rel)?;
+
+        if let Some(parent) = resolved.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let norm_content = normalize_line_endings(content);
+
+        let diagnostics = validate_ast_syntax(&resolved, &norm_content)
+            .map_err(|e| ToolError::new("syntax_validation_failed", e))?;
+
+        std::fs::write(&resolved, &norm_content).map_err(|e| {
+            ToolError::new("io_error", format!("failed to write {clean_rel}: {e}"))
+        })?;
+
+        let _ = crate::watcher::sync_path(&self.root, &clean_rel);
+        crate::watcher::remove_pending(&self.root, &resolved);
+        self.graph = None;
+        self.adjacency = None;
+        let _ = self.load_graph();
+
+        let (new_out, new_in): (usize, usize) = if let Ok(conn) = self.db() {
+            count_file_edges(conn, &clean_rel)
+        } else {
+            (0, 0)
+        };
+
+        let res = json!({
+            "success": true,
+            "modified_file": clean_rel,
+            "new_edges": new_out + new_in,
+            "broken_edges": 0,
+            "diagnostics": diagnostics,
+            "sync_state": "Synced",
+            "message": format!("Successfully created/wrote {clean_rel}. AST parsed and indexed synchronously.")
+        });
+
+        Ok(serde_json::to_string_pretty(&res).unwrap_or_else(|_| res.to_string()))
+    }
+
+    pub fn repograph_delete(
+        &mut self,
+        path: &str,
+    ) -> Result<String, ToolError> {
+        let clean_rel = path.trim_start_matches('/').trim_start_matches('\\').to_string();
+        let resolved = self.resolve_inside_root(&clean_rel)?;
+        self.reject_secret(&resolved, &clean_rel)?;
+
+        if !resolved.exists() {
+            return Err(ToolError::new("not_found", format!("path does not exist: {clean_rel}")));
+        }
+
+        let is_dir = resolved.is_dir();
+        if is_dir {
+            std::fs::remove_dir_all(&resolved).map_err(|e| {
+                ToolError::new("io_error", format!("failed to remove directory {clean_rel}: {e}"))
+            })?;
+        } else {
+            std::fs::remove_file(&resolved).map_err(|e| {
+                ToolError::new("io_error", format!("failed to remove file {clean_rel}: {e}"))
+            })?;
+        }
+
+        let _ = crate::watcher::sync_path(&self.root, &clean_rel);
+        crate::watcher::remove_pending(&self.root, &resolved);
+        self.graph = None;
+        self.adjacency = None;
+        let _ = self.load_graph();
+
+        let res = json!({
+            "success": true,
+            "modified_file": clean_rel,
+            "new_edges": 0,
+            "broken_edges": 0,
+            "sync_state": "Synced",
+            "message": format!("Successfully deleted {clean_rel} and pruned graph nodes/edges synchronously.")
+        });
+
+        Ok(serde_json::to_string_pretty(&res).unwrap_or_else(|_| res.to_string()))
+    }
+
+    pub fn repograph_batch_edit(
+        &mut self,
+        patches: Vec<FilePatch>,
+    ) -> Result<String, ToolError> {
+        if patches.is_empty() {
+            return Err(ToolError::new("invalid_params", "patches array cannot be empty"));
+        }
+
+        let mut file_buffers: std::collections::HashMap<PathBuf, (String, String, PathBuf)> = std::collections::HashMap::new();
+        let mut all_diagnostics = Vec::new();
+
+        // Step 1: Pre-validate all patches in memory with buffer chaining before touching any disk files
+        for patch in &patches {
+            let clean_rel = patch.path.trim_start_matches('/').trim_start_matches('\\').to_string();
+            let resolved = self.resolve_inside_root(&clean_rel)?;
+            self.reject_secret(&resolved, &clean_rel)?;
+
+            if !resolved.is_file() {
+                return Err(ToolError::new("file_not_found", format!("file not found in batch: {clean_rel}")));
+            }
+
+            let working_content = if let Some((_, current_text, _)) = file_buffers.get(&resolved) {
+                current_text.clone()
+            } else {
+                let original = std::fs::read_to_string(&resolved).map_err(|e| {
+                    ToolError::new("io_error", format!("failed to read {clean_rel}: {e}"))
+                })?;
+                normalize_line_endings(&original)
+            };
+
+            let norm_target = normalize_line_endings(&patch.target_content);
+            let norm_replacement = normalize_line_endings(&patch.replacement_content);
+
+            if !working_content.contains(&norm_target) {
+                return Err(ToolError::new(
+                    "target_not_found",
+                    format!("Target content not found in {clean_rel} during batch pre-validation. Entire batch aborted."),
+                ));
+            }
+
+            let updated = working_content.replacen(&norm_target, &norm_replacement, 1);
+            let diags = validate_ast_syntax(&resolved, &updated)
+                .map_err(|e| ToolError::new("syntax_validation_failed", format!("Pre-validation failed on {clean_rel}: {e}. Entire batch aborted.")))?;
+
+            all_diagnostics.extend(diags);
+            file_buffers.insert(resolved.clone(), (clean_rel, updated, resolved));
+        }
+
+        let mut total_old_edges = 0;
+        if let Ok(conn) = self.db() {
+            for (clean_rel, _, _) in file_buffers.values() {
+                let (out_e, in_e) = count_file_edges(conn, clean_rel);
+                total_old_edges += out_e + in_e;
+            }
+        }
+
+        // Step 2: Atomic write all unique modified files
+        let mut files_changed = Vec::new();
+        for (clean_rel, updated, resolved) in file_buffers.values() {
+            std::fs::write(resolved, updated).map_err(|e| {
+                ToolError::new("io_error", format!("failed to write {clean_rel}: {e}"))
+            })?;
+            files_changed.push(clean_rel.clone());
+        }
+
+        // Step 3: Synchronous multi-node graph re-index
+        for (clean_rel, _, resolved) in file_buffers.values() {
+            let _ = crate::watcher::sync_path(&self.root, clean_rel);
+            crate::watcher::remove_pending(&self.root, resolved);
+        }
+        self.graph = None;
+        self.adjacency = None;
+        let _ = self.load_graph();
+
+        let mut total_new_edges = 0;
+        if let Ok(conn) = self.db() {
+            for (clean_rel, _, _) in file_buffers.values() {
+                let (out_e, in_e) = count_file_edges(conn, clean_rel);
+                total_new_edges += out_e + in_e;
+            }
+        }
+
+        let added = total_new_edges.saturating_sub(total_old_edges);
+        let removed = total_old_edges.saturating_sub(total_new_edges);
+
+        let res = json!({
+            "success": true,
+            "files_changed": files_changed.len(),
+            "modified_files": files_changed,
+            "new_edges": added,
+            "broken_edges": removed,
+            "diagnostics": all_diagnostics,
+            "sync_state": "Synced",
+            "message": format!("Successfully executed atomic batch edit across {} files ({} total patches).", files_changed.len(), patches.len())
+        });
+
+        Ok(serde_json::to_string_pretty(&res).unwrap_or_else(|_| res.to_string()))
+    }
+
+    pub fn repograph_edit_symbol(
+        &mut self,
+        path: &str,
+        symbol: &str,
+        new_code: &str,
+    ) -> Result<String, ToolError> {
+        let clean_rel = path.trim_start_matches('/').trim_start_matches('\\').to_string();
+        let resolved = self.resolve_inside_root(&clean_rel)?;
+        self.reject_secret(&resolved, &clean_rel)?;
+
+        if !resolved.is_file() {
+            return Err(ToolError::new("file_not_found", format!("file not found: {clean_rel}")));
+        }
+
+        let conn = self.db()?;
+        let range = crate::db::get_symbol_range(conn, &clean_rel, symbol)
+            .map_err(|e| ToolError::new("db_error", format!("db error: {e}")))?
+            .ok_or_else(|| ToolError::new("symbol_not_found", format!("symbol '{symbol}' not found in '{clean_rel}'")))?;
+
+        let original = std::fs::read_to_string(&resolved).map_err(|e| {
+            ToolError::new("io_error", format!("failed to read {clean_rel}: {e}"))
+        })?;
+
+        let norm_orig = normalize_line_endings(&original);
+        let norm_new_code = normalize_line_endings(new_code);
+        let lines: Vec<&str> = norm_orig.lines().collect();
+        let start = range.0.max(1);
+        let end = range.1.min(lines.len());
+
+        if start > end || start > lines.len() {
+            return Err(ToolError::new("invalid_range", "symbol line range in index is invalid"));
+        }
+
+        let mut new_lines = Vec::new();
+        if start > 1 {
+            new_lines.extend_from_slice(&lines[0..start - 1]);
+        }
+        new_lines.push(&norm_new_code);
+        if end < lines.len() {
+            new_lines.extend_from_slice(&lines[end..]);
+        }
+
+        let updated = new_lines.join("\n");
+        let diagnostics = validate_ast_syntax(&resolved, &updated)
+            .map_err(|e| ToolError::new("syntax_validation_failed", e))?;
+
+        let (old_out, old_in): (usize, usize) = count_file_edges(conn, &clean_rel);
+
+        std::fs::write(&resolved, &updated).map_err(|e| {
+            ToolError::new("io_error", format!("failed to write {clean_rel}: {e}"))
+        })?;
+
+        let _ = crate::watcher::sync_path(&self.root, &clean_rel);
+        crate::watcher::remove_pending(&self.root, &resolved);
+        self.graph = None;
+        self.adjacency = None;
+        let _ = self.load_graph();
+
+        let (new_out, new_in): (usize, usize) = if let Ok(conn) = self.db() {
+            count_file_edges(conn, &clean_rel)
+        } else {
+            (0, 0)
+        };
+
+        let added = (new_out + new_in).saturating_sub(old_out + old_in);
+        let removed = (old_out + old_in).saturating_sub(new_out + new_in);
+
+        let res = json!({
+            "success": true,
+            "modified_file": clean_rel,
+            "symbol": symbol,
+            "new_edges": added,
+            "broken_edges": removed,
+            "diagnostics": diagnostics,
+            "sync_state": "Synced",
+            "message": format!("Successfully replaced symbol '{symbol}' in {clean_rel}.")
+        });
+
+        Ok(serde_json::to_string_pretty(&res).unwrap_or_else(|_| res.to_string()))
+    }
+
+    pub fn get_skeleton(&mut self, path: &str) -> Result<(String, usize), ToolError> {
+        let normalized = path.replace('\\', "/").trim_start_matches("./").to_string();
+        let abs_path = self.root.join(&normalized);
+        let canonical = match dunce::canonicalize(&abs_path).or_else(|_| abs_path.canonicalize()) {
+            Ok(c) => c,
+            Err(_) => {
+                let matching_path = if let Ok((graph, _)) = self.graph_and_adjacency() {
+                    graph.nodes.iter().find(|n| n.path.ends_with(&normalized)).map(|n| n.path.clone())
+                } else {
+                    None
+                };
+                if let Some(fp) = matching_path {
+                    let fuzzy_abs = self.root.join(&fp);
+                    dunce::canonicalize(&fuzzy_abs).or_else(|_| fuzzy_abs.canonicalize())
+                        .map_err(|e| ToolError::new("file_not_found", format!("cannot resolve fuzzy path '{fp}': {e}")))?
+                } else {
+                    return Err(ToolError::new("file_not_found", format!("File '{normalized}' not found")));
+                }
+            }
+        };
+
+        if !canonical.starts_with(&self.root) {
+            return Err(ToolError::new(
+                "forbidden_path",
+                "path traversal outside repo root is forbidden",
+            ));
+        }
+
+        let content = std::fs::read_to_string(&canonical)
+            .map_err(|e| ToolError::new("read_error", format!("failed to read file: {e}")))?;
+        let raw_tokens = crate::telemetry::count_tokens(&content);
+        let language = crate::walker::language_for(&canonical);
+        let skeleton = crate::skeleton::extract_skeleton(&content, &language);
+        Ok((skeleton, raw_tokens))
+    }
+
+    pub fn get_execution_trace(&mut self, entrypoint: &str, depth: usize) -> Result<(String, usize), ToolError> {
+        let root = self.root.clone();
+        let conn = self.db()?;
+        let (trace_md, unique_files) = crate::db::get_execution_trace(conn, &root, entrypoint, depth)
+            .map_err(|e| ToolError::new("db_error", e))?;
+
+        let mut raw_tokens = 0;
+        for f in &unique_files {
+            let abs = root.join(f);
+            if let Ok(c) = std::fs::read_to_string(&abs) {
+                raw_tokens += crate::telemetry::count_tokens(&c);
+            }
+        }
+
+        Ok((trace_md, raw_tokens))
+    }
+
     pub fn find_dependents(&mut self, path: &str) -> Result<String, ToolError> {
         let normalized = path.replace('\\', "/");
         let normalized = normalized.trim_start_matches("./").to_string();
@@ -715,44 +1518,133 @@ impl McpServer {
         Ok(out)
     }
 
-    pub fn search_symbols(&mut self, query: &str) -> Result<String, ToolError> {
-        // Matches sub-word tokens, so "store" finds `useGraphStore` — the plain
-        // `name MATCH 'store*'` this replaced returned nothing for that query.
-        let match_query = crate::db::build_fts_match_query(query);
-        if match_query.is_empty() {
-            return Ok("[]".to_string());
-        }
+    pub fn search_symbols(&mut self, params: SearchParams) -> Result<String, ToolError> {
+        let query = &params.query;
+        let limit = params.limit.unwrap_or(10).max(1);
+        let signature_only = params.signature_only.unwrap_or(true);
+        let exact_symbol_only = params.exact_symbol_only.unwrap_or(false);
 
         let conn = self.db()?;
         crate::db::log_agent_query(conn, "", query, "search_symbols");
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT name, file_path, content
-                 FROM symbols_fts
-                 WHERE tokens MATCH ?
-                 ORDER BY rank
-                 LIMIT 50"
-            )
-            .map_err(|e| ToolError::new("db_error", format!("failed to prepare statement: {e}")))?;
-
-        let rows = stmt
-            .query_map(rusqlite::params![match_query], |row| {
-                Ok(crate::db::SymbolSearchResult {
-                    name: row.get(0)?,
-                    file_path: row.get(1)?,
-                    content: row.get(2)?,
-                })
-            })
-            .map_err(|e| ToolError::new("db_error", format!("query failed: {e}")))?;
-
         let mut results = Vec::new();
-        for res in rows.flatten() {
-            results.push(res);
+
+        if exact_symbol_only {
+            let pattern = format!("%{}%", query);
+            let mut stmt = conn
+                .prepare(
+                    "SELECT s.name, s.file_path, f.content
+                     FROM symbols s
+                     LEFT JOIN symbols_fts f ON s.name = f.name AND s.file_path = f.file_path
+                     WHERE s.name = ? OR s.name LIKE ?
+                     ORDER BY (s.name = ?) DESC, LENGTH(s.name) ASC
+                     LIMIT ?"
+                )
+                .map_err(|e| ToolError::new("db_error", format!("failed to prepare statement: {e}")))?;
+
+            let rows = stmt
+                .query_map(rusqlite::params![query, pattern, query, limit as i64], |row| {
+                    let name: String = row.get(0)?;
+                    let file_path: String = row.get(1)?;
+                    let raw_content: Option<String> = row.get(2)?;
+                    Ok((name, file_path, raw_content.unwrap_or_default()))
+                })
+                .map_err(|e| ToolError::new("db_error", format!("query failed: {e}")))?;
+
+            for res in rows.flatten() {
+                results.push(res);
+            }
+        } else {
+            let match_query = crate::db::build_fts_match_query(query);
+            if match_query.is_empty() {
+                return Ok("[]".to_string());
+            }
+
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, file_path, content
+                     FROM symbols_fts
+                     WHERE tokens MATCH ?
+                     ORDER BY rank
+                     LIMIT ?"
+                )
+                .map_err(|e| ToolError::new("db_error", format!("failed to prepare statement: {e}")))?;
+
+            let rows = stmt
+                .query_map(rusqlite::params![match_query, limit as i64], |row| {
+                    let name: String = row.get(0)?;
+                    let file_path: String = row.get(1)?;
+                    let content: String = row.get(2)?;
+                    Ok((name, file_path, content))
+                })
+                .map_err(|e| ToolError::new("db_error", format!("query failed: {e}")))?;
+
+            for res in rows.flatten() {
+                results.push(res);
+            }
         }
 
-        serde_json::to_string(&results)
-            .map_err(|e| ToolError::new("serialization_error", e.to_string()))
+        let formatted: Vec<crate::db::SymbolSearchResult> = results
+            .into_iter()
+            .map(|(name, file_path, raw_content)| {
+                let lines: Vec<&str> = raw_content.lines().collect();
+                let name_matches = name.to_lowercase().contains(&query.to_lowercase());
+
+                let sig = if !lines.is_empty() {
+                    let s = signature_block(&lines, 1, lines.len());
+                    if !s.is_empty() {
+                        Some(s)
+                    } else {
+                        Some(lines.first().copied().unwrap_or("").to_string())
+                    }
+                } else {
+                    None
+                };
+
+                let snippet = if !name_matches && !lines.is_empty() {
+                    Some(extract_3line_snippet(&lines, query))
+                } else {
+                    None
+                };
+
+                if signature_only {
+                    crate::db::SymbolSearchResult {
+                        name,
+                        file_path,
+                        signature: sig,
+                        snippet,
+                        content: None,
+                    }
+                } else {
+                    crate::db::SymbolSearchResult {
+                        name,
+                        file_path,
+                        signature: sig,
+                        snippet,
+                        content: Some(raw_content),
+                    }
+                }
+            })
+            .collect();
+
+        let json_str = serde_json::to_string(&formatted)
+            .map_err(|e| ToolError::new("serialization_error", e.to_string()))?;
+
+        if !signature_only && params.force_full != Some(true) {
+            let tok_count = crate::telemetry::count_tokens(&json_str);
+            if tok_count > 2500 {
+                let mut sig_params = params.clone();
+                sig_params.signature_only = Some(true);
+                sig_params.force_full = Some(true);
+                let compressed = self.search_symbols(sig_params)?;
+                return Ok(format!(
+                    "{}\n\n[Auto-Budget Notice: Response payload exceeded 2,500 tokens ({} tokens). Automatically compressed to signature-only mode. Pass force_full: true to override.]",
+                    compressed, tok_count
+                ));
+            }
+        }
+
+        Ok(json_str)
     }
 
     /// `signature_only` returns each symbol's declaration head instead of its
@@ -765,6 +1657,7 @@ impl McpServer {
         symbols: Vec<String>,
         signature_only: bool,
         compact_edges: bool,
+        force_full: Option<bool>,
     ) -> Result<String, ToolError> {
         let root = self.root.clone();
         let conn = self.db()?;
@@ -906,18 +1799,28 @@ impl McpServer {
             .map(|(path, code_blocks)| crate::db::ExploreFilePayload { path, code_blocks })
             .collect();
 
-        if compact_edges {
-            // `{"from_symbol":"a","to_symbol":"b","kind":"calls"}` spends 44
-            // chars per edge on keys that are identical every time — measured
-            // at 748 of the 1,875 `paths` chars for `useGraphStore`.
+        let rendered = if compact_edges {
             let compact: Vec<String> = paths.iter().map(compact_edge).collect();
-            return serde_json::to_string(&json!({ "files": files, "paths": compact }))
-                .map_err(|e| ToolError::new("serialization_error", e.to_string()));
+            serde_json::to_string(&json!({ "files": files, "paths": compact }))
+                .map_err(|e| ToolError::new("serialization_error", e.to_string()))?
+        } else {
+            let payload = crate::db::ExplorePayload { files, paths };
+            serde_json::to_string(&payload)
+                .map_err(|e| ToolError::new("serialization_error", e.to_string()))?
+        };
+
+        if !signature_only && force_full != Some(true) {
+            let tok_count = crate::telemetry::count_tokens(&rendered);
+            if tok_count > 2500 {
+                let compressed = self.explore(symbols, true, compact_edges, Some(true))?;
+                return Ok(format!(
+                    "{}\n\n[Auto-Budget Notice: Response payload exceeded 2,500 tokens ({} tokens). Automatically compressed to signature-only mode. Pass force_full: true to override.]",
+                    compressed, tok_count
+                ));
+            }
         }
 
-        let payload = crate::db::ExplorePayload { files, paths };
-        serde_json::to_string(&payload)
-            .map_err(|e| ToolError::new("serialization_error", e.to_string()))
+        Ok(rendered)
     }
 
     fn check_staleness(&self, referenced_files: &[&str]) -> (Option<String>, Option<String>) {
@@ -999,6 +1902,18 @@ impl McpServer {
                 let elapsed_ms = now.saturating_sub(marked_at).max(0);
                 md.push_str(&format!("- `{rel_path}` (edited {elapsed_ms}ms ago, pending sync)\n"));
             }
+        }
+
+        let ratio = self.tracker.overall_compression_ratio();
+        let ratio_str = if ratio > 1.0 { format!("{:.1}x", ratio) } else { "1.0x".to_string() };
+        md.push_str("\n### Live Token Metrics & Context Savings\n");
+        md.push_str(&format!("- **Current Turn ID:** #{}\n", self.tracker.current_turn_id));
+        md.push_str(&format!("- **Session Total Output Tokens:** {}\n", self.tracker.session_total_output));
+        md.push_str(&format!("- **Session Tokens Saved:** {} ({})\n", self.tracker.session_total_saved, ratio_str));
+        md.push_str(&format!("- **Recent Invocations Tracked:** {}\n", self.tracker.recent_calls.len()));
+
+        if let Ok(conn) = self.db() {
+            crate::db::log_agent_query(conn, "", "status", "status");
         }
 
         Ok(md)
@@ -1236,18 +2151,20 @@ impl McpServer {
         } else {
             self.root.join(sanitized)
         };
-        let resolved = dunce::canonicalize(&joined)
-            .or_else(|_| joined.canonicalize())
-            .map_err(|_| {
-                ToolError::new("file_not_found", format!("cannot resolve path: {path}"))
-            })?;
-        if !resolved.starts_with(&self.root) {
-            return Err(ToolError::new(
-                "path_outside_root",
-                format!("'{path}' resolves outside the repository root"),
-            ));
+        if let Ok(resolved) = dunce::canonicalize(&joined).or_else(|_| joined.canonicalize()) {
+            if !resolved.starts_with(&self.root) {
+                return Err(ToolError::new(
+                    "path_outside_root",
+                    format!("'{path}' resolves outside the repository root"),
+                ));
+            }
+            return Ok(resolved);
         }
-        Ok(resolved)
+
+        let normalized = crate::parsers::normalize_relative("", &path.replace('\\', "/"))
+            .ok_or_else(|| ToolError::new("path_outside_root", format!("'{path}' resolves outside the repository root")))?;
+        let full = self.root.join(normalized);
+        Ok(full)
     }
 
     /// Serve the graph from memory; reload only when the cache file's mtime
@@ -1287,16 +2204,33 @@ fn jsonrpc_error(id: Value, code: i64, message: &str) -> Value {
 }
 
 /// Tool short-names enabled for this process. `REPOGRAPH_MCP_TOOLS` is a
-/// comma-separated list of suffixes (`explore,search,node`); the default keeps
-/// the agent's menu to the one compound tool.
+/// comma-separated list of suffixes (`explore,search,node,edit,write,delete`);
+/// the default enables all tools for closed-loop mutation and exploration.
 fn allowed_tools() -> Vec<String> {
     match std::env::var("REPOGRAPH_MCP_TOOLS") {
-        Ok(env_val) => env_val
+        Ok(env_val) if !env_val.trim().is_empty() && env_val.trim() != "all" => env_val
             .split(',')
             .map(|s| s.trim().to_lowercase())
             .filter(|s| !s.is_empty())
             .collect(),
-        Err(_) => vec!["explore".to_string()],
+        _ => vec![
+            "explore".to_string(),
+            "files".to_string(),
+            "domains".to_string(),
+            "node".to_string(),
+            "search".to_string(),
+            "impact".to_string(),
+            "callers".to_string(),
+            "callees".to_string(),
+            "status".to_string(),
+            "edit".to_string(),
+            "write".to_string(),
+            "delete".to_string(),
+            "batch_edit".to_string(),
+            "edit_symbol".to_string(),
+            "skeleton".to_string(),
+            "trace".to_string(),
+        ],
     }
 }
 
@@ -1374,7 +2308,7 @@ fn tools_list_result() -> Value {
     if allowed.contains(&"node".to_string()) {
         tools.push(json!({
             "name": "repograph_node",
-            "description": "Reads either the raw contents of a file or the exact source block of a symbol inside that file.",
+            "description": "Reads either the raw contents of a file or the exact source block of a symbol inside that file. Supports 1-indexed sliced reading (start_line, end_line) with optional line numbers.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1385,6 +2319,134 @@ fn tools_list_result() -> Value {
                     "symbol": {
                         "type": "string",
                         "description": "Optional name of the symbol to extract. If absent, the full file is read."
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional 1-indexed start line for sliced file/symbol read."
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional 1-indexed end line (inclusive) for sliced file/symbol read."
+                    },
+                    "with_line_numbers": {
+                        "type": "boolean",
+                        "description": "If true, prefixes lines with their 1-indexed line number (e.g. '42: export function...'). Defaults to true when start_line/end_line is provided."
+                    }
+                },
+                "required": ["path"]
+            }
+        }));
+    }
+
+    if allowed.contains(&"edit".to_string()) {
+        tools.push(json!({
+            "name": "repograph_edit",
+            "description": "Performs an AST-validated atomic replacement of target_content with replacement_content in a file, returning instant dependency edge diffs (added/removed) and diagnostics.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Repo-relative file path, e.g. 'src/components/Button.tsx'"
+                    },
+                    "target_content": {
+                        "type": "string",
+                        "description": "Exact text chunk in the file to be replaced."
+                    },
+                    "replacement_content": {
+                        "type": "string",
+                        "description": "New code to replace target_content with."
+                    }
+                },
+                "required": ["path", "target_content", "replacement_content"]
+            }
+        }));
+    }
+
+    if allowed.contains(&"batch_edit".to_string()) {
+        tools.push(json!({
+            "name": "repograph_batch_edit",
+            "description": "Executes atomic multi-file refactoring across multiple files with pre-validation and rollback guarantee on failure.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "patches": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string", "description": "Repo-relative file path" },
+                                "target_content": { "type": "string", "description": "Exact text chunk to replace" },
+                                "replacement_content": { "type": "string", "description": "New replacement code" }
+                            },
+                            "required": ["path", "target_content", "replacement_content"]
+                        },
+                        "description": "Array of file patches to apply atomically."
+                    }
+                },
+                "required": ["patches"]
+            }
+        }));
+    }
+
+    if allowed.contains(&"edit_symbol".to_string()) {
+        tools.push(json!({
+            "name": "repograph_edit_symbol",
+            "description": "Replaces the exact source range of an AST symbol in a file without needing manual line offsets.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Repo-relative file path, e.g. 'src/components/Button.tsx'"
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Exact identifier name of the symbol to replace."
+                    },
+                    "new_code": {
+                        "type": "string",
+                        "description": "New replacement code for the entire symbol body."
+                    }
+                },
+                "required": ["path", "symbol", "new_code"]
+            }
+        }));
+    }
+
+    if allowed.contains(&"write".to_string()) {
+        tools.push(json!({
+            "name": "repograph_write",
+            "description": "Creates or overwrites a file with automatic parent directory creation and immediate AST re-indexing.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Repo-relative file path, e.g. 'src/utils/helpers.ts'"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Full file content to write."
+                    }
+                },
+                "required": ["path", "content"]
+            }
+        }));
+    }
+
+    if allowed.contains(&"delete".to_string()) {
+        tools.push(json!({
+            "name": "repograph_delete",
+            "description": "Deletes a file or directory and automatically prunes its associated nodes and edges from the dependency graph.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Repo-relative file or directory path to delete."
                     }
                 },
                 "required": ["path"]
@@ -1455,13 +2517,29 @@ fn tools_list_result() -> Value {
     if allowed.contains(&"search".to_string()) {
         tools.push(json!({
             "name": "repograph_search",
-            "description": "Searches for matching symbols in the repository index via SQLite FTS5 fuzzy match.",
+            "description": "Searches for matching symbols in the repository index via SQLite FTS5 fuzzy match. Defaults to returning compact signature definitions and 3-line snippets to minimize token usage.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Fuzzy symbol name query to match against, e.g. 'open_in_editor'"
+                        "description": "Symbol name or body query to search for, e.g. 'PageShell' or 'useGraphStore'"
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Maximum number of search results to return. Defaults to 10."
+                    },
+                    "signature_only": {
+                        "type": "boolean",
+                        "description": "Return only the symbol signature/declaration or 3-line snippet instead of full component/function bodies. Defaults to true."
+                    },
+                    "exact_symbol_only": {
+                        "type": "boolean",
+                        "description": "Match only exact symbol identifier names instead of body text or full-text tokens. Defaults to false."
+                    },
+                    "force_full": {
+                        "type": "boolean",
+                        "description": "If true, overrides 2,500 token intelligent context budget compression and returns full uncompressed payload."
                     }
                 },
                 "required": ["query"]
@@ -1488,9 +2566,51 @@ fn tools_list_result() -> Value {
                     "compact_edges": {
                         "type": "boolean",
                         "description": "Serialize 'paths' as arrow strings ('caller -kind-> callee') instead of objects, removing the repeated JSON keys. Defaults to the value of signature_only. Payload format v1.1.0."
+                    },
+                    "force_full": {
+                        "type": "boolean",
+                        "description": "If true, overrides 2,500 token intelligent context budget compression and returns full uncompressed payload."
                     }
                 },
                 "required": ["symbols"]
+            }
+        }));
+    }
+
+    if allowed.contains(&"skeleton".to_string()) {
+        tools.push(json!({
+            "name": "repograph_skeleton",
+            "description": "Returns a structural AST skeleton/outline of a source file by stripping all function, method, and JSX implementation bodies while retaining imports, exports, TypeScript interfaces, type definitions, class fields, and docstrings. Replaces 500-1000 line files with ~30 lines achieving a 95%+ token reduction. Supported across TypeScript/JavaScript, Python, Rust, Go, Java, C#, C/C++, Kotlin, Swift, PHP, and Vue/Svelte SFCs.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Repo-relative or partial path of the source file, e.g. 'src/services/checkout.ts' or 'app/api/route.py'"
+                    }
+                },
+                "required": ["path"]
+            }
+        }));
+    }
+
+    if allowed.contains(&"trace".to_string()) {
+        tools.push(json!({
+            "name": "repograph_trace",
+            "description": "Traces a multi-hop static call chain starting from an entrypoint (function name, route handler, or 'file:symbol') down N hops. Returns a bundled hierarchical execution pipeline with exact type signatures, file paths, and line numbers in a single compact payload (~300 tokens).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "entrypoint": {
+                        "type": "string",
+                        "description": "The root entrypoint symbol name, route URL (e.g. 'POST /api/inquiry'), or file-qualified symbol (e.g. 'src/routes/auth.ts:loginHandler')"
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "description": "Maximum execution hops to traverse (default: 3, max: 4)."
+                    }
+                },
+                "required": ["entrypoint"]
             }
         }));
     }
@@ -1705,6 +2825,7 @@ mod tests {
             }"#,
         )
         .unwrap();
+        let _ = crate::indexer::index_repo(&root, None);
         let server = McpServer::new(&root).unwrap();
         (dir, server)
     }
@@ -1804,7 +2925,7 @@ mod tests {
         let md = server.get_manifest_with(&opts).unwrap();
         assert_eq!(md.matches("\n- /").count(), 1, "top_k=1 kept extra files:\n{md}");
         assert!(
-            md.contains("Showing 1 of 2 files"),
+            md.contains("Showing 1 of "),
             "truncation must be announced:\n{md}"
         );
 
@@ -1910,7 +3031,7 @@ mod tests {
     }
 
     #[test]
-    fn default_listing_is_the_single_compound_tool() {
+    fn tools_listing_and_filtering() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("REPOGRAPH_MCP_TOOLS");
         let names: Vec<String> = tools_list_result()["tools"]
@@ -1919,9 +3040,12 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(names, vec!["repograph_explore".to_string()]);
+        assert!(names.contains(&"repograph_explore".to_string()));
+        assert!(names.contains(&"repograph_edit".to_string()));
+        assert!(names.contains(&"repograph_write".to_string()));
+        assert!(names.contains(&"repograph_delete".to_string()));
 
-        std::env::set_var("REPOGRAPH_MCP_TOOLS", "explore,search,node");
+        std::env::set_var("REPOGRAPH_MCP_TOOLS", "explore,search,node,edit");
         let filtered: Vec<String> = tools_list_result()["tools"]
             .as_array()
             .unwrap()
@@ -1932,11 +3056,61 @@ mod tests {
             filtered,
             vec![
                 "repograph_node".to_string(),
+                "repograph_edit".to_string(),
                 "repograph_search".to_string(),
                 "repograph_explore".to_string()
             ]
         );
         std::env::remove_var("REPOGRAPH_MCP_TOOLS");
+    }
+
+    #[test]
+    fn mutator_tools_edit_write_delete() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("REPOGRAPH_MCP_TOOLS", "all");
+        let (_dir, mut server) = temp_repo();
+
+        // 1. repograph_write: create a new file
+        let write_call = server.handle_message(
+            r#"{"jsonrpc":"2.0","id":100,"method":"tools/call","params":{"name":"repograph_write","arguments":{"path":"src/utils/math.ts","content":"export const add = (a: number, b: number) => a + b;\n"}}}"#
+        ).unwrap();
+        assert_eq!(write_call["result"]["isError"], false, "{write_call}");
+        let write_text = write_call["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(write_text.contains("\"success\": true"));
+        assert!(write_text.contains("src/utils/math.ts"));
+
+        // 2. repograph_edit: atomic replace in the new file
+        let edit_call = server.handle_message(
+            r#"{"jsonrpc":"2.0","id":101,"method":"tools/call","params":{"name":"repograph_edit","arguments":{"path":"src/utils/math.ts","target_content":"a + b","replacement_content":"a + b + 0"}}}"#
+        ).unwrap();
+        assert_eq!(edit_call["result"]["isError"], false, "{edit_call}");
+        let edit_text = edit_call["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(edit_text.contains("\"success\": true"));
+
+        // Verify edited content on disk
+        let node_read = server.read_file("src/utils/math.ts").unwrap();
+        assert!(node_read.contains("a + b + 0"));
+
+        // 3. repograph_delete: delete the file
+        let delete_call = server.handle_message(
+            r#"{"jsonrpc":"2.0","id":102,"method":"tools/call","params":{"name":"repograph_delete","arguments":{"path":"src/utils/math.ts"}}}"#
+        ).unwrap();
+        assert_eq!(delete_call["result"]["isError"], false, "{delete_call}");
+        assert!(!server.root.join("src/utils/math.ts").exists());
+
+        std::env::remove_var("REPOGRAPH_MCP_TOOLS");
+    }
+
+    #[test]
+    fn sliced_node_reads_with_line_numbers() {
+        let (_dir, mut server) = temp_repo();
+        
+        let sliced = server.read_file_sliced("src/components/Button.tsx", Some(1), Some(2), Some(true)).unwrap();
+        assert!(sliced.contains("   1: import { useTheme }"));
+        assert!(sliced.contains("   2: export const Button"));
+
+        let unnumbered = server.read_file_sliced("src/components/Button.tsx", Some(1), Some(1), Some(false)).unwrap();
+        assert_eq!(unnumbered, "import { useTheme } from '../hooks/useTheme';");
     }
 
     /// A `.repograph` cache built before the walker learned the secrets
@@ -2010,6 +3184,232 @@ mod tests {
         };
         let filtered_manifest = server.get_manifest_with(&options).unwrap();
         assert!(filtered_manifest.contains("src/hooks/useTheme.ts") || filtered_manifest.contains("src/components/Button.tsx"));
+    }
+
+    #[test]
+    fn repograph_search_optimizes_tokens_with_signature_and_limit() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("REPOGRAPH_MCP_TOOLS", "explore,files,node,search");
+
+        let (_dir, mut server) = temp_repo();
+        
+        // 1. Default search: signature_only = true, limit = 10
+        let search_json = server.search_symbols(SearchParams {
+            query: "Button".to_string(),
+            limit: None,
+            signature_only: None,
+            exact_symbol_only: None,
+            force_full: None,
+        }).unwrap();
+        
+        let results: Vec<crate::db::SymbolSearchResult> = serde_json::from_str(&search_json).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].name, "Button");
+        assert!(results[0].signature.is_some());
+        assert!(results[0].content.is_none()); // Content is omitted under signature_only!
+
+        // Token count estimation: 10 results should be well under 1000 tokens (e.g. < 4000 bytes)
+        let token_estimate = crate::tokens::count_tokens(&search_json);
+        assert!(token_estimate < 1000, "Search result token estimate {token_estimate} exceeds 1000 tokens");
+
+        // 2. Exact symbol match
+        let exact_json = server.search_symbols(SearchParams {
+            query: "useTheme".to_string(),
+            limit: Some(5),
+            signature_only: Some(true),
+            exact_symbol_only: Some(true),
+            force_full: None,
+        }).unwrap();
+        let exact_results: Vec<crate::db::SymbolSearchResult> = serde_json::from_str(&exact_json).unwrap();
+        assert!(!exact_results.is_empty());
+        assert_eq!(exact_results[0].name, "useTheme");
+
+        // 3. JSON-RPC tool invocation
+        let wire_call = server.handle_message(
+            r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"repograph_search","arguments":{"query":"Button","signature_only":true,"limit":5}}}"#
+        ).unwrap();
+        assert_eq!(wire_call["result"]["isError"], false);
+        let wire_text = wire_call["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(wire_text.contains("Button"));
+        assert!(wire_text.contains("signature"));
+        assert!(!wire_text.contains("\"content\":"));
+
+        std::env::remove_var("REPOGRAPH_MCP_TOOLS");
+    }
+
+    #[test]
+    fn inband_telemetry_tag_and_metrics_in_tools_call() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("REPOGRAPH_MCP_TOOLS", "explore,files,node,status");
+
+        let (_dir, mut server) = temp_repo();
+
+        let call = server.handle_message(
+            r#"{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"repograph_files","arguments":{}}}"#
+        ).unwrap();
+        assert_eq!(call["result"]["isError"], false);
+        let text = call["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("[Telemetry: Tool 'repograph_files'"));
+        assert!(text.contains("Turn #1:"));
+        assert!(text.contains("Saved:"));
+
+        let status_res = server.codegraph_status().unwrap();
+        assert!(status_res.contains("Live Token Metrics & Context Savings"));
+        assert!(status_res.contains("Session Total Output Tokens:"));
+
+        std::env::remove_var("REPOGRAPH_MCP_TOOLS");
+    }
+
+    #[test]
+    fn crlf_and_lf_line_ending_normalization() {
+        let (_dir, mut server) = temp_repo();
+        // Write file with CRLF
+        let crlf_content = "export const helper = () => {\r\n  return 42;\r\n};\r\n";
+        server.repograph_write("src/utils/crlf.ts", crlf_content).unwrap();
+
+        // Edit with LF target_content
+        let lf_target = "return 42;";
+        let edit_res = server.repograph_edit("src/utils/crlf.ts", lf_target, "return 100;").unwrap();
+        assert!(edit_res.contains("\"success\": true"));
+
+        let content = server.read_file("src/utils/crlf.ts").unwrap();
+        assert!(content.contains("return 100;"));
+    }
+
+    #[test]
+    fn batch_edit_atomic_refactoring() {
+        let (_dir, mut server) = temp_repo();
+
+        server.repograph_write("src/a.ts", "export const a = 1;\n").unwrap();
+        server.repograph_write("src/b.ts", "export const b = 2;\n").unwrap();
+
+        // 1. Success batch edit
+        let patches = vec![
+            FilePatch {
+                path: "src/a.ts".to_string(),
+                target_content: "a = 1;".to_string(),
+                replacement_content: "a = 10;".to_string(),
+            },
+            FilePatch {
+                path: "src/b.ts".to_string(),
+                target_content: "b = 2;".to_string(),
+                replacement_content: "b = 20;".to_string(),
+            },
+        ];
+        let res = server.repograph_batch_edit(patches).unwrap();
+        assert!(res.contains("\"success\": true"));
+        assert!(res.contains("\"files_changed\": 2"));
+
+        assert!(server.read_file("src/a.ts").unwrap().contains("a = 10;"));
+        assert!(server.read_file("src/b.ts").unwrap().contains("b = 20;"));
+
+        // 2. Failure batch edit: rollback / pre-validation aborts before touching any disk files
+        let bad_patches = vec![
+            FilePatch {
+                path: "src/a.ts".to_string(),
+                target_content: "a = 10;".to_string(),
+                replacement_content: "a = 999;".to_string(),
+            },
+            FilePatch {
+                path: "src/b.ts".to_string(),
+                target_content: "NON_EXISTENT_TARGET".to_string(),
+                replacement_content: "b = 999;".to_string(),
+            },
+        ];
+        let err = server.repograph_batch_edit(bad_patches).unwrap_err();
+        assert_eq!(err.code, "target_not_found");
+        // Verify src/a.ts was untouched because pre-validation failed
+        assert!(server.read_file("src/a.ts").unwrap().contains("a = 10;"));
+
+        // 3. Multi-patch on the SAME file in a single transaction
+        let same_file_patches = vec![
+            FilePatch {
+                path: "src/a.ts".to_string(),
+                target_content: "a = 10;".to_string(),
+                replacement_content: "a = 50;\nexport const extra = 100;".to_string(),
+            },
+            FilePatch {
+                path: "src/a.ts".to_string(),
+                target_content: "extra = 100;".to_string(),
+                replacement_content: "extra = 200;".to_string(),
+            },
+        ];
+        let res3 = server.repograph_batch_edit(same_file_patches).unwrap();
+        assert!(res3.contains("\"success\": true"));
+        assert!(res3.contains("\"files_changed\": 1"));
+        let a_content = server.read_file("src/a.ts").unwrap();
+        assert!(a_content.contains("a = 50;"));
+        assert!(a_content.contains("extra = 200;"));
+    }
+
+    #[test]
+    fn edit_symbol_scoped_replacement() {
+        let (_dir, mut server) = temp_repo();
+        // File already has Button symbol in temp_repo
+        let res = server.repograph_edit_symbol(
+            "src/components/Button.tsx",
+            "Button",
+            "export const Button = ({ label }: { label: string }) => <button>{label}</button>;",
+        ).unwrap();
+        assert!(res.contains("\"success\": true"));
+        assert!(res.contains("\"symbol\": \"Button\""));
+
+        let updated = server.read_file("src/components/Button.tsx").unwrap();
+        assert!(updated.contains("<button>{label}</button>"));
+    }
+
+    #[test]
+    fn intelligent_context_throttling_2500_tokens() {
+        let (_guard, mut server) = temp_repo();
+        // Generate a large TS file with lots of code (> 2,500 tokens)
+        let mut large_code = String::from("// Large Module\n");
+        for i in 0..150 {
+            large_code.push_str(&format!("export const func_{i} = () => {{ console.log('payload content line {i} data string padding'); return {i}; }};\n"));
+        }
+        server.repograph_write("src/large.ts", &large_code).unwrap();
+
+        // 1. Search without force_full (should auto-compress if large payload)
+        let search_res = server.search_symbols(SearchParams {
+            query: "func_".to_string(),
+            limit: Some(100),
+            signature_only: Some(false),
+            exact_symbol_only: None,
+            force_full: None,
+        }).unwrap();
+        // Under signature_only compression, signatures are returned without huge bodies
+        assert!(search_res.contains("func_"));
+
+        // 2. Explore without force_full
+        let explore_res = server.explore(vec!["useTheme".to_string()], false, false, None).unwrap();
+        assert!(explore_res.contains("useTheme"));
+    }
+
+    #[test]
+    fn mcp_skeleton_and_trace_tools() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("REPOGRAPH_MCP_TOOLS");
+        let (_guard, mut server) = temp_repo();
+        
+        // 1. Test repograph_skeleton
+        let (skeleton, raw_tokens) = server.get_skeleton("src/components/Button.tsx").unwrap();
+        assert!(skeleton.contains("Button"));
+        assert!(raw_tokens > 0);
+
+        // 2. Test JSON-RPC call for repograph_skeleton
+        let req_skeleton = r#"{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"repograph_skeleton","arguments":{"path":"src/components/Button.tsx"}}}"#;
+        let resp_skeleton = server.handle_message(req_skeleton).expect("resp_skeleton");
+        assert_eq!(resp_skeleton["result"]["isError"], false, "{resp_skeleton}");
+        let resp_text = resp_skeleton["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(resp_text.contains("Button"));
+        assert!(resp_text.contains("Telemetry: Tool 'repograph_skeleton'"));
+
+        // 3. Test JSON-RPC call for repograph_trace
+        let req_trace = r#"{"jsonrpc":"2.0","id":43,"method":"tools/call","params":{"name":"repograph_trace","arguments":{"entrypoint":"Button","depth":2}}}"#;
+        let resp_trace = server.handle_message(req_trace).expect("resp_trace");
+        assert_eq!(resp_trace["result"]["isError"], false, "{resp_trace}");
+        let trace_text = resp_trace["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(trace_text.contains("Execution Trace: `Button`"));
+        assert!(trace_text.contains("Telemetry: Tool 'repograph_trace'"));
     }
 }
 

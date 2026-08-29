@@ -4,7 +4,7 @@
 
 use super::EntryPoint;
 
-/// First quoted string literal (`"…"` or `'…'`) in `s`, plus the remainder
+/// First quoted string literal (`"…"`, `'…'`, or `` `…` ``) in `s`, plus the remainder
 /// after the closing quote. Tolerates a leading `r`/`r#` raw prefix (Rust,
 /// Tornado `r"..."` patterns).
 pub fn quoted_arg(s: &str) -> Option<(String, &str)> {
@@ -12,7 +12,7 @@ pub fn quoted_arg(s: &str) -> Option<(String, &str)> {
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i] as char;
-        if c == '"' || c == '\'' {
+        if c == '"' || c == '\'' || c == '`' {
             let quote = c;
             let rest = &s[i + 1..];
             let end = rest.find(quote)?;
@@ -25,6 +25,20 @@ pub fn quoted_arg(s: &str) -> Option<(String, &str)> {
         i += 1;
     }
     None
+}
+
+/// Joins base and sub route paths ensuring single slash separation.
+pub fn join_route_paths(base: &str, sub: &str) -> String {
+    let b = base.trim().trim_end_matches('/');
+    let s = sub.trim().trim_start_matches('/');
+    if b.is_empty() {
+        if s.starts_with('/') { s.to_string() } else { format!("/{s}") }
+    } else if s.is_empty() {
+        if b.starts_with('/') { b.to_string() } else { format!("/{b}") }
+    } else {
+        let lead = if b.starts_with('/') { "" } else { "/" };
+        format!("{lead}{b}/{s}")
+    }
 }
 
 /// First identifier chain after the next comma: `foo`, `Controller.method`,
@@ -187,7 +201,7 @@ pub fn scan_annotation_routes(source: &str, entry_points: &mut Vec<EntryPoint>) 
                     .find(|p| !p.is_empty())
                     .unwrap_or("");
                 let first_line = pending.first().map(|(_, _, l)| *l).unwrap_or(line_num);
-                let route = format!("{class_base}{method_path}");
+                let route = join_route_paths(&class_base, method_path);
                 if !route.is_empty() {
                     entry_points.push(entry(route, Some(method), first_line));
                 }
@@ -270,8 +284,13 @@ mod tests {
     fn quoted_arg_handles_both_quote_styles_and_raw() {
         assert_eq!(quoted_arg(r#""/users", handler)"#).unwrap().0, "/users");
         assert_eq!(quoted_arg("'/items')").unwrap().0, "/items");
+        assert_eq!(quoted_arg("`/orders/${id}`").unwrap().0, "/orders/${id}");
         assert_eq!(quoted_arg(r#"r"/regex/(\d+)", H)"#).unwrap().0, "/regex/(\\d+)");
         assert!(quoted_arg("handler)").is_none());
+
+        assert_eq!(join_route_paths("/api/users", "list"), "/api/users/list");
+        assert_eq!(join_route_paths("/api/users/", "/list"), "/api/users/list");
+        assert_eq!(join_route_paths("", "health"), "/health");
     }
 
     #[test]

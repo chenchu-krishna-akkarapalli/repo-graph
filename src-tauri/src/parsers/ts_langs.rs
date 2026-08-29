@@ -12,8 +12,8 @@ use super::ts_engine::LanguageSpec;
 const JAVA_QUERY: &str = r#"
 (class_declaration
   name: (identifier) @name
-  superclass: (superclass (type_identifier) @extends)?
-  interfaces: (super_interfaces (type_list (type_identifier) @implements))?) @sym.class
+  superclass: (superclass [(type_identifier) (generic_type (type_identifier))] @extends)?
+  interfaces: (super_interfaces (type_list [(type_identifier) (generic_type (type_identifier))] @implements))?) @sym.class
 
 (interface_declaration name: (identifier) @name) @sym.interface
 (enum_declaration name: (identifier) @name) @sym.enum
@@ -149,6 +149,8 @@ pub fn spec_cpp() -> LanguageSpec {
 const GO_QUERY: &str = r#"
 (function_declaration name: (identifier) @name) @sym.function
 (method_declaration name: (field_identifier) @name) @sym.method
+(type_declaration (type_spec name: (type_identifier) @name type: (struct_type))) @sym.struct
+(type_declaration (type_spec name: (type_identifier) @name type: (interface_type))) @sym.interface
 (type_declaration (type_spec name: (type_identifier) @name)) @sym.type_alias
 
 (import_spec path: (interpreted_string_literal) @import)
@@ -164,7 +166,9 @@ pub fn spec_go() -> LanguageSpec {
 // -------------------------------------------------------------- Python -----
 
 const PYTHON_QUERY: &str = r#"
-(class_definition name: (identifier) @name) @sym.class
+(class_definition
+  name: (identifier) @name
+  superclasses: (argument_list (identifier) @extends)?) @sym.class
 (function_definition name: (identifier) @name) @sym.function
 
 (import_statement (dotted_name) @import)

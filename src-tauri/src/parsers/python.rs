@@ -36,8 +36,20 @@ impl Extractor for PythonExtractor {
                     }
                 }
             } else if let Some(rest) = trimmed.strip_prefix("from ") {
-                if let Some(module) = rest.split_whitespace().next() {
-                    push_module(&mut result, &base_dir, module);
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                if let Some(&module) = parts.first() {
+                    if (module == "." || module == "..") && parts.len() >= 3 && parts[1] == "import" {
+                        let imported_names = parts[2..].join(" ");
+                        for sym in imported_names.split(',') {
+                            let clean_sym = sym.trim();
+                            if !clean_sym.is_empty() {
+                                let sub_mod = format!("{module}{clean_sym}");
+                                push_module(&mut result, &base_dir, &sub_mod);
+                            }
+                        }
+                    } else {
+                        push_module(&mut result, &base_dir, module);
+                    }
                 }
             } else if trimmed.starts_with('@') {
                 if let Some(route) = decorator_route(trimmed) {
@@ -315,7 +327,7 @@ mod tests {
     fn absolute_and_relative_imports() {
         let r = run(
             "pkg/api/users.py",
-            "import os\nfrom fastapi import APIRouter\nfrom .schemas import User\nfrom ..core.db import session\n",
+            "import os\nfrom fastapi import APIRouter\nfrom .schemas import User\nfrom . import models\nfrom ..core.db import session\n",
         );
         let stems: Vec<(&str, bool)> = r
             .imports
@@ -328,6 +340,7 @@ mod tests {
                 ("os", true),
                 ("fastapi", true),
                 ("pkg/api/schemas", false),
+                ("pkg/api/models", false),
                 ("pkg/core/db", false),
             ]
         );

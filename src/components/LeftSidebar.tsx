@@ -22,6 +22,7 @@ import { httpMethodOf, METHOD_BADGE, METHOD_ORDER } from '../lib/httpMethod'
 import { copyContextPrompt } from '../lib/promptExporter'
 import { copyAsciiLayout } from '../lib/layoutExporter'
 import { detectCommunities } from '../lib/community'
+import { cleanUncPath } from '../lib/fileTree'
 import MermaidViewer from './MermaidViewer'
 import type { FileTreeNode } from '../types'
 
@@ -79,6 +80,7 @@ export default function LeftSidebar() {
   const [showIntegrationModal, setShowIntegrationModal] = useState(false)
   const [mcpSnippet, setMcpSnippet] = useState<McpConfigSnippet | null>(null)
   const [mcpSnippetError, setMcpSnippetError] = useState<string | null>(null)
+  const [copiedKey, setCopiedKey] = useState<string | null>(null)
   const dragging = useRef(false)
   const [recentProjects, setRecentProjects] = useState<{ path: string }[]>([])
   const [dropdownOpen, setDropdownOpen] = useState(false)
@@ -89,6 +91,25 @@ export default function LeftSidebar() {
   const graph = useGraphStore((s) => s.graph)
   const contextCount = useGraphStore((s) => s.contextFiles.size + s.contextSymbols.size)
   const nativeAvailable = tauriInvoke() !== null
+
+  const handleCopySnippet = async (key: string, text: string) => {
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopiedKey(key)
+      setTimeout(() => setCopiedKey(null), 1500)
+    } catch (err) {
+      console.error('Failed to copy snippet: ', err)
+    }
+  }
+
+  useEffect(() => {
+    if (!showIntegrationModal) return
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setShowIntegrationModal(false)
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [showIntegrationModal])
 
   // Fetched fresh each time the modal opens (rather than on mount) so it
   // always reflects the currently open project's `args`, and re-detects the
@@ -107,7 +128,8 @@ export default function LeftSidebar() {
     }
     setMcpSnippet(null)
     setMcpSnippetError(null)
-    invoke('get_mcp_config_snippet', { projectRoot: activeProjectRoot ?? PLACEHOLDER_ROOT })
+    const targetRoot = cleanUncPath(activeProjectRoot) || PLACEHOLDER_ROOT
+    invoke('get_mcp_config_snippet', { projectRoot: targetRoot })
       .then((res) => setMcpSnippet(res as McpConfigSnippet))
       .catch((e) => setMcpSnippetError(e instanceof Error ? e.message : String(e)))
   }, [showIntegrationModal, activeProjectRoot])
@@ -345,13 +367,20 @@ export default function LeftSidebar() {
       </aside>
 
       {showIntegrationModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md p-4">
-          <div className="max-h-[88vh] w-full max-w-xl overflow-y-auto rounded-2xl border border-white/10 bg-[#0F1218] p-5 shadow-2xl text-left text-white backdrop-blur-xl">
+        <div
+          onClick={() => setShowIntegrationModal(false)}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md p-4"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="max-h-[88vh] w-full max-w-xl overflow-y-auto rounded-2xl border border-white/10 bg-[#0F1218] p-5 shadow-2xl text-left text-white backdrop-blur-xl"
+          >
             <div className="flex items-center justify-between border-b border-white/10 pb-3">
               <h3 className="text-sm font-semibold text-white/90">Integrate Agent (MCP Config)</h3>
               <button
                 onClick={() => setShowIntegrationModal(false)}
                 className="rounded-lg p-1 text-white/40 hover:bg-white/10 hover:text-white/90 cursor-pointer border-0 bg-transparent transition-colors"
+                title="Close (Esc)"
               >
                 ✕
               </button>
@@ -400,36 +429,73 @@ export default function LeftSidebar() {
                   )}
 
                   <div>
-                    <span className="block font-medium text-white/80 mb-1">
-                      1. Claude Desktop Config (`claude_desktop_config.json`)
-                    </span>
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-medium text-white/80">
+                        1. Claude Desktop Config (`claude_desktop_config.json`)
+                      </span>
+                      <button
+                        onClick={() => handleCopySnippet('claude', mcpSnippet.claude_desktop_json)}
+                        className="rounded px-2 py-0.5 text-[10px] font-medium bg-white/5 border border-white/10 text-white/70 hover:bg-white/10 hover:text-white transition-colors cursor-pointer"
+                      >
+                        {copiedKey === 'claude' ? '✓ Copied' : 'Copy JSON'}
+                      </button>
+                    </div>
                     <pre className="overflow-x-auto rounded-lg bg-[#07080B] p-3 font-mono text-[10px] text-white/80 border border-white/10 select-all">
                       {mcpSnippet.claude_desktop_json}
                     </pre>
                   </div>
 
                   <div>
-                    <span className="block font-medium text-white/80 mb-1">
-                      2. Codex Config (`.codex/config.toml`)
-                    </span>
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-medium text-white/80">
+                        2. Codex Config (`.codex/config.toml`)
+                      </span>
+                      <button
+                        onClick={() => handleCopySnippet('codex', mcpSnippet.codex_toml)}
+                        className="rounded px-2 py-0.5 text-[10px] font-medium bg-white/5 border border-white/10 text-white/70 hover:bg-white/10 hover:text-white transition-colors cursor-pointer"
+                      >
+                        {copiedKey === 'codex' ? '✓ Copied' : 'Copy TOML'}
+                      </button>
+                    </div>
                     <pre className="overflow-x-auto rounded-lg bg-[#07080B] p-3 font-mono text-[10px] text-white/80 border border-white/10 select-all">
                       {mcpSnippet.codex_toml}
                     </pre>
                   </div>
 
                   <div>
-                    <span className="block font-medium text-white/80 mb-1">
-                      3. VS Code Config (`.vscode/mcp.json`)
-                    </span>
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-medium text-white/80">
+                        3. VS Code / Cursor / Antigravity (`.vscode/mcp.json` or `.cursor/mcp.json`)
+                      </span>
+                      <button
+                        onClick={() => handleCopySnippet('vscode', mcpSnippet.vscode_json)}
+                        className="rounded px-2 py-0.5 text-[10px] font-medium bg-white/5 border border-white/10 text-white/70 hover:bg-white/10 hover:text-white transition-colors cursor-pointer"
+                      >
+                        {copiedKey === 'vscode' ? '✓ Copied' : 'Copy JSON'}
+                      </button>
+                    </div>
                     <pre className="overflow-x-auto rounded-lg bg-[#07080B] p-3 font-mono text-[10px] text-white/80 border border-white/10 select-all">
                       {mcpSnippet.vscode_json}
                     </pre>
                   </div>
 
                   <div>
-                    <span className="block font-medium text-white/80 mb-1">4. CLI Integration Command</span>
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="font-medium text-white/80">4. CLI Integration Command</span>
+                      <button
+                        onClick={() =>
+                          handleCopySnippet(
+                            'cli',
+                            `claude mcp add repo-graph --env REPOGRAPH_MCP_TOOLS="${mcpToolsEnv(mcpSnippet)}" -- "${mcpSnippet.binary_path}" "${cleanUncPath(activeProjectRoot) || PLACEHOLDER_ROOT}"`
+                          )
+                        }
+                        className="rounded px-2 py-0.5 text-[10px] font-medium bg-white/5 border border-white/10 text-white/70 hover:bg-white/10 hover:text-white transition-colors cursor-pointer"
+                      >
+                        {copiedKey === 'cli' ? '✓ Copied' : 'Copy Command'}
+                      </button>
+                    </div>
                     <div className="relative rounded-lg bg-[#07080B] p-3 font-mono text-[10px] text-white/80 border border-white/10 break-all select-all">
-                      {`claude mcp add repo-graph --env REPOGRAPH_MCP_TOOLS="${mcpToolsEnv(mcpSnippet)}" -- "${mcpSnippet.binary_path}" "${activeProjectRoot ? activeProjectRoot.replace(/\\/g, '/') : PLACEHOLDER_ROOT}"`}
+                      {`claude mcp add repo-graph --env REPOGRAPH_MCP_TOOLS="${mcpToolsEnv(mcpSnippet)}" -- "${mcpSnippet.binary_path}" "${cleanUncPath(activeProjectRoot) || PLACEHOLDER_ROOT}"`}
                     </div>
                   </div>
 

@@ -7,8 +7,7 @@ description: Review changed code for correctness, then verify the findings befor
 
 ## 1. Scope the diff
 Review what changed, plus what the change can break. Use
-`repograph_impact(path, symbol)` for the blast radius — pass **both**
-arguments; a bare symbol silently returns no callers.
+`repograph_impact(symbol="<name>")` or `repograph_impact(path="<path>")` for the blast radius.
 
 ## 2. Read what you are judging
 Signatures are enough to map the call graph; they are not enough to review

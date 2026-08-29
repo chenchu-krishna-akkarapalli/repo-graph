@@ -13,7 +13,7 @@ use swc_ecma_ast::{
     Callee, Decl, ExportSpecifier, Expr, Lit, Module, ModuleDecl, ModuleExportName, ModuleItem,
     Pat,
 };
-use swc_ecma_parser::{Parser, Syntax, TsSyntax};
+use swc_ecma_parser::{EsSyntax, Parser, Syntax, TsSyntax};
 use swc_ecma_visit::{Visit, VisitWith};
 
 pub struct JsExtractor;
@@ -144,17 +144,18 @@ impl Visit for SymbolVisitor {
             }
             Decl::Var(v) => {
                 for decl in &v.decls {
-                    if let Pat::Ident(bi) = &decl.name {
-                        let name = bi.id.sym.to_string();
-                        let (start, end) = self.get_lines(decl.span);
-                        let raw_kind = if let Some(init) = &decl.init {
-                            match &**init {
-                                Expr::Arrow(_) | Expr::Fn(_) => "Function",
-                                _ => "Variable",
-                            }
-                        } else {
-                            "Variable"
-                        };
+                    let mut names = Vec::new();
+                    collect_pat_idents(&decl.name, &mut names);
+                    let (start, end) = self.get_lines(decl.span);
+                    let raw_kind = if let Some(init) = &decl.init {
+                        match &**init {
+                            Expr::Arrow(_) | Expr::Fn(_) => "Function",
+                            _ => "Variable",
+                        }
+                    } else {
+                        "Variable"
+                    };
+                    for name in names {
                         let kind = self.map_kind(&name, raw_kind);
                         self.symbols.push(ExtractedSymbol {
                             name,
@@ -229,81 +230,102 @@ impl Extractor for JsExtractor {
     fn extract(&self, file_path: &Path, source: &str) -> ExtractionResult {
         let mut result = ExtractionResult::default();
 
-        if let Some(route) = next_app_router_route(file_path) {
-            result.entry_points.push(EntryPoint {
-                route,
-                handler: None,
-                line: 0,
-            });
-        }
+        let next_route = next_app_router_route(file_path).or_else(|| next_pages_router_route(file_path));
 
-        let ParseOutcome { cm, module, recovered } = match parse(file_path, source) {
-            Ok(outcome) => outcome,
+        let parse_outcome = parse(file_path, source);
+        match parse_outcome {
+            Ok(outcome) => {
+                let ParseOutcome { cm, module, recovered } = outcome;
+                if recovered {
+                    result.warnings.push("partial_parse".to_string());
+                }
+
+                let mut visitor = SymbolVisitor {
+                    cm: cm.clone(),
+                    symbols: Vec::new(),
+                    references: Vec::new(),
+                    inheritance: Vec::new(),
+                    file_path: file_path.to_path_buf(),
+                };
+                module.visit_with(&mut visitor);
+                result.symbols = visitor.symbols;
+                result.references = visitor.references;
+                result.inheritance = visitor.inheritance;
+
+                let base_dir = parent_dir(file_path);
+                for item in &module.body {
+                    let ModuleItem::ModuleDecl(decl) = item else {
+                        continue;
+                    };
+                    match decl {
+                        ModuleDecl::Import(imp) => {
+                            push_import(&mut result, &base_dir, &str_value(&imp.src), EdgeKind::Import);
+                        }
+                        ModuleDecl::ExportDecl(ed) => collect_decl_exports(&ed.decl, &mut result.exports),
+                        ModuleDecl::ExportDefaultDecl(_) | ModuleDecl::ExportDefaultExpr(_) => {
+                            result.exports.push("default".to_string());
+                        }
+                        ModuleDecl::ExportNamed(ne) => {
+                            for spec in &ne.specifiers {
+                                if let ExportSpecifier::Named(named) = spec {
+                                    let name = named.exported.as_ref().unwrap_or(&named.orig);
+                                    result.exports.push(export_name(name));
+                                }
+                            }
+                            if let Some(src) = &ne.src {
+                                push_import(&mut result, &base_dir, &str_value(src), EdgeKind::Import);
+                            }
+                        }
+                        ModuleDecl::ExportAll(ea) => {
+                            push_import(&mut result, &base_dir, &str_value(&ea.src), EdgeKind::Import);
+                        }
+                        _ => {}
+                    }
+                }
+
+                // require(...) and dynamic import(...) live in expression position.
+                let mut calls = CallScanner::default();
+                module.visit_with(&mut calls);
+                for spec in calls.requires {
+                    push_import(&mut result, &base_dir, &spec, EdgeKind::Require);
+                }
+                for spec in calls.dynamic_literals {
+                    push_import(&mut result, &base_dir, &spec, EdgeKind::Import);
+                }
+                if calls.unresolved_dynamic {
+                    result.warnings.push("unresolved_dynamic".to_string());
+                }
+            }
             Err(_) => {
                 result.warnings.push("parse_error".to_string());
-                return result; // never fatal: file stays in the graph, unmapped
-            }
-        };
-        if recovered {
-            // The map is usable but incomplete here — say so rather than
-            // letting an agent trust it silently.
-            result.warnings.push("partial_parse".to_string());
-        }
-
-        let mut visitor = SymbolVisitor {
-            cm: cm.clone(),
-            symbols: Vec::new(),
-            references: Vec::new(),
-            inheritance: Vec::new(),
-            file_path: file_path.to_path_buf(),
-        };
-        module.visit_with(&mut visitor);
-        result.symbols = visitor.symbols;
-        result.references = visitor.references;
-        result.inheritance = visitor.inheritance;
-
-        let base_dir = parent_dir(file_path);
-        for item in &module.body {
-            let ModuleItem::ModuleDecl(decl) = item else {
-                continue;
-            };
-            match decl {
-                ModuleDecl::Import(imp) => {
-                    push_import(&mut result, &base_dir, &str_value(&imp.src), EdgeKind::Import);
-                }
-                ModuleDecl::ExportDecl(ed) => collect_decl_exports(&ed.decl, &mut result.exports),
-                ModuleDecl::ExportDefaultDecl(_) | ModuleDecl::ExportDefaultExpr(_) => {
-                    result.exports.push("default".to_string());
-                }
-                ModuleDecl::ExportNamed(ne) => {
-                    for spec in &ne.specifiers {
-                        if let ExportSpecifier::Named(named) = spec {
-                            let name = named.exported.as_ref().unwrap_or(&named.orig);
-                            result.exports.push(export_name(name));
-                        }
-                    }
-                    if let Some(src) = &ne.src {
-                        push_import(&mut result, &base_dir, &str_value(src), EdgeKind::Import);
-                    }
-                }
-                ModuleDecl::ExportAll(ea) => {
-                    push_import(&mut result, &base_dir, &str_value(&ea.src), EdgeKind::Import);
-                }
-                _ => {}
+                fallback_line_scan(source, file_path, &mut result);
             }
         }
 
-        // require(...) and dynamic import(...) live in expression position.
-        let mut calls = CallScanner::default();
-        module.visit_with(&mut calls);
-        for spec in calls.requires {
-            push_import(&mut result, &base_dir, &spec, EdgeKind::Require);
-        }
-        for spec in calls.dynamic_literals {
-            push_import(&mut result, &base_dir, &spec, EdgeKind::Import);
-        }
-        if calls.unresolved_dynamic {
-            result.warnings.push("unresolved_dynamic".to_string());
+        // Next.js entry points and route HTTP handlers
+        if let Some(route) = next_route {
+            const HTTP_METHODS: &[&str] = &["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
+            let handlers: Vec<String> = result
+                .exports
+                .iter()
+                .filter(|e| HTTP_METHODS.contains(&e.as_str()))
+                .cloned()
+                .collect();
+            if handlers.is_empty() {
+                result.entry_points.push(EntryPoint {
+                    route,
+                    handler: None,
+                    line: 0,
+                });
+            } else {
+                for h in handlers {
+                    result.entry_points.push(EntryPoint {
+                        route: route.clone(),
+                        handler: Some(h),
+                        line: 0,
+                    });
+                }
+            }
         }
 
         // Playbook §19.1 route scanners (line-scan, cheap by design).
@@ -443,14 +465,55 @@ fn parse(file_path: &Path, source: &str) -> Result<ParseOutcome, ()> {
         Lrc::new(FileName::Custom(file_path.display().to_string())),
         source.to_string(),
     );
-    let mut parser = Parser::new(syntax_for(file_path), StringInput::from(&*fm), None);
-    let module = parser.parse_module().map_err(|_| ())?;
-    // `take_errors` returns *recoverable* diagnostics — swc still produced a
-    // usable module. Discarding it threw away every symbol, import and edge in
-    // an otherwise fine file; the file is now kept and the gap is reported as
-    // a `partial_parse` warning instead.
-    let recovered = !parser.take_errors().is_empty();
-    Ok(ParseOutcome { cm, module, recovered })
+
+    // Primary syntax based on file extension
+    let primary_syntax = syntax_for(file_path);
+    let mut parser = Parser::new(primary_syntax, StringInput::from(&*fm), None);
+    if let Ok(module) = parser.parse_module() {
+        let recovered = !parser.take_errors().is_empty();
+        return Ok(ParseOutcome { cm, module, recovered });
+    }
+
+    // Fallback 1: Force TSX mode (common when JSX syntax is used in .ts files or Next.js components)
+    let tsx_syntax = Syntax::Typescript(TsSyntax {
+        tsx: true,
+        decorators: true,
+        no_early_errors: true,
+        ..Default::default()
+    });
+    let mut parser = Parser::new(tsx_syntax, StringInput::from(&*fm), None);
+    if let Ok(module) = parser.parse_module() {
+        return Ok(ParseOutcome { cm, module, recovered: true });
+    }
+
+    // Fallback 2: Plain TypeScript without TSX (for generic arrow functions / type casts)
+    let ts_syntax = Syntax::Typescript(TsSyntax {
+        tsx: false,
+        decorators: true,
+        no_early_errors: true,
+        ..Default::default()
+    });
+    let mut parser = Parser::new(ts_syntax, StringInput::from(&*fm), None);
+    if let Ok(module) = parser.parse_module() {
+        return Ok(ParseOutcome { cm, module, recovered: true });
+    }
+
+    // Fallback 3: ES syntax with JSX and decorators enabled
+    let es_syntax = Syntax::Es(EsSyntax {
+        jsx: true,
+        fn_bind: true,
+        decorators: true,
+        decorators_before_export: true,
+        export_default_from: true,
+        import_attributes: true,
+        ..Default::default()
+    });
+    let mut parser = Parser::new(es_syntax, StringInput::from(&*fm), None);
+    if let Ok(module) = parser.parse_module() {
+        return Ok(ParseOutcome { cm, module, recovered: true });
+    }
+
+    Err(())
 }
 
 fn push_import(result: &mut ExtractionResult, base_dir: &str, specifier: &str, kind: EdgeKind) {
@@ -468,15 +531,41 @@ fn push_import(result: &mut ExtractionResult, base_dir: &str, specifier: &str, k
     });
 }
 
+fn collect_pat_idents(pat: &Pat, names: &mut Vec<String>) {
+    match pat {
+        Pat::Ident(bi) => names.push(bi.id.sym.to_string()),
+        Pat::Array(arr) => {
+            for elem in arr.elems.iter().flatten() {
+                collect_pat_idents(elem, names);
+            }
+        }
+        Pat::Object(obj) => {
+            for prop in &obj.props {
+                match prop {
+                    swc_ecma_ast::ObjectPatProp::KeyValue(kv) => {
+                        collect_pat_idents(&kv.value, names);
+                    }
+                    swc_ecma_ast::ObjectPatProp::Assign(assign) => {
+                        names.push(assign.key.sym.to_string());
+                    }
+                    swc_ecma_ast::ObjectPatProp::Rest(rest) => {
+                        collect_pat_idents(&rest.arg, names);
+                    }
+                }
+            }
+        }
+        Pat::Rest(rest) => collect_pat_idents(&rest.arg, names),
+        _ => {}
+    }
+}
+
 fn collect_decl_exports(decl: &Decl, exports: &mut Vec<String>) {
     match decl {
         Decl::Fn(f) => exports.push(f.ident.sym.to_string()),
         Decl::Class(c) => exports.push(c.ident.sym.to_string()),
         Decl::Var(v) => {
             for d in &v.decls {
-                if let Pat::Ident(bi) = &d.name {
-                    exports.push(bi.id.sym.to_string());
-                }
+                collect_pat_idents(&d.name, exports);
             }
         }
         Decl::TsInterface(i) => exports.push(i.id.sym.to_string()),
@@ -530,15 +619,102 @@ impl Visit for CallScanner {
     }
 }
 
-/// `app/**/page.tsx`, `app/**/route.ts`, `app/**/layout.tsx` (optionally
-/// under `src/`) → route string. `[param]` → `:param`; `(group)` segments
-/// are elided, matching Next.js semantics.
+/// Fallback line-scanner when AST parsing fails on invalid / experimental syntax.
+fn fallback_line_scan(source: &str, file_path: &Path, result: &mut ExtractionResult) {
+    let base_dir = parent_dir(file_path);
+    for (idx, line) in source.lines().enumerate() {
+        let line_num = idx + 1;
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") || trimmed.starts_with('*') {
+            continue;
+        }
+
+        // Match imports: import ... from 'specifier' or import('specifier')
+        if (trimmed.starts_with("import ") || trimmed.starts_with("import{")) && trimmed.contains("from") {
+            if let Some(spec) = extract_quoted_specifier(trimmed) {
+                push_import(result, &base_dir, &spec, EdgeKind::Import);
+            }
+        } else if trimmed.starts_with("export ") && trimmed.contains("from") {
+            if let Some(spec) = extract_quoted_specifier(trimmed) {
+                push_import(result, &base_dir, &spec, EdgeKind::Import);
+            }
+        } else if trimmed.contains("require(") {
+            if let Some(spec) = extract_require_specifier(trimmed) {
+                push_import(result, &base_dir, &spec, EdgeKind::Require);
+            }
+        }
+
+        // Match export named: export function foo, export const bar, export class Baz
+        if trimmed.starts_with("export ") {
+            let rest = trimmed.trim_start_matches("export").trim_start();
+            if rest.starts_with("default ") {
+                result.exports.push("default".to_string());
+            } else if let Some(name) = extract_declaration_name(rest) {
+                result.exports.push(name.clone());
+                result.symbols.push(ExtractedSymbol {
+                    name,
+                    kind: "function".to_string(),
+                    start_line: line_num,
+                    end_line: line_num,
+                });
+            }
+        }
+    }
+}
+
+fn extract_quoted_specifier(line: &str) -> Option<String> {
+    for quote in ['\'', '"'] {
+        if let Some(pos) = line.rfind(quote) {
+            let before = &line[..pos];
+            if let Some(start_pos) = before.rfind(quote) {
+                let spec = &before[start_pos + 1..];
+                if !spec.is_empty() {
+                    return Some(spec.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_require_specifier(line: &str) -> Option<String> {
+    if let Some(req_idx) = line.find("require(") {
+        let after = &line[req_idx + 8..];
+        extract_quoted_specifier(after)
+    } else {
+        None
+    }
+}
+
+fn extract_declaration_name(s: &str) -> Option<String> {
+    let s = s.trim_start_matches("async ").trim_start();
+    let prefixes = ["function ", "class ", "const ", "let ", "var ", "interface ", "type ", "enum "];
+    for p in prefixes {
+        if s.starts_with(p) {
+            let ident_part = s[p.len()..].trim_start();
+            let ident: String = ident_part
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+                .collect();
+            if !ident.is_empty() {
+                return Some(ident);
+            }
+        }
+    }
+    None
+}
+
+/// `app/**/page.tsx`, `app/**/route.ts`, `app/**/layout.tsx`, etc.
+/// `[param]` → `:param`, `[...slug]` → `:slug*`, `[[...slug]]` → `:slug*?`, `(group)` segments are elided.
 fn next_app_router_route(file_path: &Path) -> Option<String> {
     let rel = file_path.to_string_lossy().replace('\\', "/");
     let segments: Vec<&str> = rel.split('/').collect();
     let file = segments.last()?;
     let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or(file);
-    if !matches!(stem, "page" | "route" | "layout") {
+    if !matches!(
+        stem,
+        "page" | "route" | "layout" | "loading" | "error" | "template" | "not-found" | "default"
+    ) {
         return None;
     }
     let app_idx = segments
@@ -547,10 +723,17 @@ fn next_app_router_route(file_path: &Path) -> Option<String> {
         .filter(|&i| i == 0 || (i == 1 && segments[0] == "src"))?;
     let mut route = String::new();
     for seg in &segments[app_idx + 1..segments.len() - 1] {
-        if seg.starts_with('(') && seg.ends_with(')') {
+        if (seg.starts_with('(') && seg.ends_with(')')) || seg.starts_with('@') {
             continue;
         }
-        let part = if seg.starts_with('[') && seg.ends_with(']') {
+        if seg.starts_with('_') {
+            return None; // private folders are omitted from route tree
+        }
+        let part = if seg.starts_with("[[...") && seg.ends_with("]]") {
+            format!(":{}*?", &seg[5..seg.len() - 2])
+        } else if seg.starts_with("[...") && seg.ends_with(']') {
+            format!(":{}*", &seg[4..seg.len() - 1])
+        } else if seg.starts_with('[') && seg.ends_with(']') {
             format!(":{}", &seg[1..seg.len() - 1])
         } else {
             (*seg).to_string()
@@ -558,6 +741,54 @@ fn next_app_router_route(file_path: &Path) -> Option<String> {
         route.push('/');
         route.push_str(&part);
     }
+    Some(if route.is_empty() { "/".to_string() } else { route })
+}
+
+/// Next.js Pages Router: `pages/**` or `src/pages/**`
+fn next_pages_router_route(file_path: &Path) -> Option<String> {
+    let rel = file_path.to_string_lossy().replace('\\', "/");
+    let segments: Vec<&str> = rel.split('/').collect();
+    let file = segments.last()?;
+    let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or(file);
+
+    // Ignore Next.js custom app / document files
+    if matches!(stem, "_app" | "_document" | "_error") {
+        return None;
+    }
+    let pages_idx = segments
+        .iter()
+        .position(|s| *s == "pages")
+        .filter(|&i| i == 0 || (i == 1 && segments[0] == "src"))?;
+
+    let mut route = String::new();
+    for seg in &segments[pages_idx + 1..segments.len() - 1] {
+        let part = if seg.starts_with("[[...") && seg.ends_with("]]") {
+            format!(":{}*?", &seg[5..seg.len() - 2])
+        } else if seg.starts_with("[...") && seg.ends_with(']') {
+            format!(":{}*", &seg[4..seg.len() - 1])
+        } else if seg.starts_with('[') && seg.ends_with(']') {
+            format!(":{}", &seg[1..seg.len() - 1])
+        } else {
+            (*seg).to_string()
+        };
+        route.push('/');
+        route.push_str(&part);
+    }
+
+    if stem != "index" {
+        let part = if stem.starts_with("[[...") && stem.ends_with("]]") {
+            format!(":{}*?", &stem[5..stem.len() - 2])
+        } else if stem.starts_with("[...") && stem.ends_with(']') {
+            format!(":{}*", &stem[4..stem.len() - 1])
+        } else if stem.starts_with('[') && stem.ends_with(']') {
+            format!(":{}", &stem[1..stem.len() - 1])
+        } else {
+            stem.to_string()
+        };
+        route.push('/');
+        route.push_str(&part);
+    }
+
     Some(if route.is_empty() { "/".to_string() } else { route })
 }
 
@@ -672,6 +903,14 @@ const z = import(someVariable);
             Some("/dashboard/:id".to_string())
         );
         assert_eq!(
+            next_app_router_route(Path::new("src/app/docs/[...slug]/page.tsx")),
+            Some("/docs/:slug*".to_string())
+        );
+        assert_eq!(
+            next_app_router_route(Path::new("src/app/shop/[[...slug]]/page.tsx")),
+            Some("/shop/:slug*?".to_string())
+        );
+        assert_eq!(
             next_app_router_route(Path::new("app/(marketing)/about/page.tsx")),
             Some("/about".to_string())
         );
@@ -682,6 +921,45 @@ const z = import(someVariable);
         assert_eq!(next_app_router_route(Path::new("src/app/page.tsx")), Some("/".to_string()));
         assert_eq!(next_app_router_route(Path::new("src/components/page-header.tsx")), None);
         assert_eq!(next_app_router_route(Path::new("lib/app/page.tsx")), None);
+    }
+
+    #[test]
+    fn next_pages_router_routes() {
+        assert_eq!(
+            next_pages_router_route(Path::new("pages/index.tsx")),
+            Some("/".to_string())
+        );
+        assert_eq!(
+            next_pages_router_route(Path::new("src/pages/about.tsx")),
+            Some("/about".to_string())
+        );
+        assert_eq!(
+            next_pages_router_route(Path::new("src/pages/api/users/[id].ts")),
+            Some("/api/users/:id".to_string())
+        );
+        assert_eq!(
+            next_pages_router_route(Path::new("pages/_app.tsx")),
+            None
+        );
+    }
+
+    #[test]
+    fn next_route_handlers_bind_http_methods() {
+        let r = run(
+            "src/app/api/auth/route.ts",
+            r#"
+import { NextResponse } from 'next/server';
+export async function GET(request: Request) { return NextResponse.json({ ok: true }); }
+export async function POST(request: Request) { return NextResponse.json({ ok: true }); }
+"#,
+        );
+        assert_eq!(
+            routes_of(&r),
+            vec![
+                ("/api/auth".to_string(), Some("GET".to_string())),
+                ("/api/auth".to_string(), Some("POST".to_string())),
+            ]
+        );
     }
 
     fn routes_of(r: &ExtractionResult) -> Vec<(String, Option<String>)> {
@@ -738,5 +1016,23 @@ Route.get('/admin', 'AdminController.index');
             routes_of(&index),
             vec![("/".to_string(), Some("default".to_string()))]
         );
+    }
+
+    #[test]
+    fn destructured_named_exports() {
+        let r = run(
+            "src/api.ts",
+            r#"
+export const { get, post, put } = createApiClient();
+export const [useAuth, AuthProvider] = createAuthContext();
+"#,
+        );
+        assert!(r.exports.contains(&"get".to_string()));
+        assert!(r.exports.contains(&"post".to_string()));
+        assert!(r.exports.contains(&"put".to_string()));
+        assert!(r.exports.contains(&"useAuth".to_string()));
+        assert!(r.exports.contains(&"AuthProvider".to_string()));
+        assert!(r.symbols.iter().any(|s| s.name == "useAuth"));
+        assert!(r.symbols.iter().any(|s| s.name == "get"));
     }
 }

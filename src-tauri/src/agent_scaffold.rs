@@ -28,7 +28,7 @@ pub const SCAFFOLD_DIR: &str = ".myrepograph-agent";
 pub const OPT_OUT_ENV: &str = "REPOGRAPH_NO_SCAFFOLD";
 
 /// Context architecture version stamped into the generated `agent.yaml`.
-pub const ARCHITECTURE: &str = "CEPA-v1.1";
+pub const ARCHITECTURE: &str = "CEPA-v1.4";
 
 /// Directories created under `.myrepograph-agent/`, including the empty ones —
 /// they are part of the contract even before anything fills them.
@@ -41,6 +41,8 @@ const DIRS: &[&str] = &[
     "knowledge",
     "memory/runtime",
     "skills/code-review",
+    "skills/codebase-design",
+    "skills/improve-codebase-architecture",
     "tools",
     "workflows",
 ];
@@ -60,20 +62,15 @@ fn opted_out() -> bool {
     )
 }
 
-/// Create `.myrepograph-agent/` at `root` if it is not already there.
+/// Create `.myrepograph-agent/` and any missing skill files/subdirectories at `root`.
 ///
-/// Idempotent: returns `Ok(())` immediately when the directory exists, and
-/// even when forced past that check it never replaces an existing file.
+/// Idempotent: uses `create_new(true)` for each file so user edits and existing files
+/// are never overwritten, but newly added skills or missing files are automatically provisioned.
 pub fn ensure_agent_scaffold(root: &Path) -> io::Result<()> {
     if opted_out() {
         return Ok(());
     }
     let base = root.join(SCAFFOLD_DIR);
-    if base.exists() {
-        // The documented trigger is "directory absent". Re-walking a populated
-        // scaffold on every index would be pointless I/O on the hot path.
-        return Ok(());
-    }
     write_scaffold(&base, workspace_name(root))
 }
 
@@ -121,7 +118,6 @@ fn workspace_name(root: &Path) -> &str {
         .unwrap_or("workspace")
 }
 
-/// `(relative path, contents)` for every generated file.
 fn templates(workspace: &str) -> Vec<(PathBuf, String)> {
     vec![
         (PathBuf::from("agent.yaml"), root_agent_yaml(workspace)),
@@ -159,6 +155,14 @@ fn templates(workspace: &str) -> Vec<(PathBuf, String)> {
             PathBuf::from("skills/code-review/review.sh"),
             code_review_script().to_string(),
         ),
+        (
+            PathBuf::from("skills/codebase-design/SKILL.md"),
+            codebase_design_skill().to_string(),
+        ),
+        (
+            PathBuf::from("skills/improve-codebase-architecture/SKILL.md"),
+            improve_codebase_architecture_skill().to_string(),
+        ),
     ]
 }
 
@@ -186,7 +190,9 @@ fn root_agent_yaml(workspace: &str) -> String {
          agents:\n\
          \x20 - agents/fact-checker\n\
          skills:\n\
-         \x20 - skills/code-review\n"
+         \x20 - skills/code-review\n\
+         \x20 - skills/codebase-design\n\
+         \x20 - skills/improve-codebase-architecture\n"
     )
 }
 
@@ -220,17 +226,34 @@ fn agents_md() -> &'static str {
 }
 
 fn rules_md() -> &'static str {
-    "# RULES.md — Workspace Guardrails\n\
+    "# Master Context Engineering & Behavioral Token Rules\n\
      \n\
-     ## Must always\n\
-     - Resolve code through the `repograph_*` tools before reading files by hand.\n\
-     - Quote retrieved facts verbatim; cite the file path they came from.\n\
-     - Track multi-step work in `memory/runtime/context.md`, not in the reply.\n\
+     This directory serves as the centralized source of truth for AI coding agents operating within the Repo Graph repository.\n\
      \n\
-     ## Must never\n\
-     - Guess a file's contents. The map tells you *where* to look, not *what* is inside.\n\
-     - Edit code you have only seen as a signature.\n\
-     - Treat an empty result as an error — it means \"no match\"; refine the query.\n\
+     <!-- BEGIN REPO-GRAPH-SYNC-POLICY v1.4 -->\n\
+     # MCP Continuous Sync & Strict Token Cost-Cutting Policy\n\
+     \n\
+     1. **Persistent Session Priority**:\n\
+        - Always prioritize calling `repo-graph` MCP tools (`repograph_skeleton`, `repograph_trace`, `repograph_explore`, `repograph_files`, `repograph_node`, `repograph_impact`, `repograph_edit`, `repograph_write`, `repograph_delete`, `repograph_batch_edit`, `repograph_edit_symbol`, `repograph_status`) instead of brute-force directory scans or native shell commands.\n\
+     2. **Pre-Flight Check & Context Restoration (Start of Turn)**:\n\
+        - On the first turn of any task or session, call `repograph_status` to verify connection and confirm `Sync State` is `Synced`.\n\
+        - Read `.myrepograph-agent/memory/runtime/context.md` to restore working context, active task goals, and previously resolved symbol references without wasting tokens re-indexing.\n\
+     3. **AST Ghost Skeletons (No Full-File Dumps)**:\n\
+        - Use `repograph_skeleton(path=\"...\")` for complete structural overviews (95%+ token reduction) before inspecting or reading implementations.\n\
+        - For targeted blocks, use `repograph_node(path=\"...\", start_line=N, end_line=M, with_line_numbers=true)`. Prohibit reading entire files (>50 lines).\n\
+     4. **Multi-Hop Execution Traces & Scoped Discovery**:\n\
+        - Use `repograph_trace(entrypoint=\"...\", depth=3)` for end-to-end execution pipelines (80%+ token reduction) across routes, handlers, and databases.\n\
+        - Use `repograph_files(scope=\"src/**\")` to bound file discovery.\n\
+        - Ingest signatures only (`signature_only: true`) via `repograph_explore` during architecture exploration.\n\
+     5. **Strict Bounded Searches**:\n\
+        - Bound all `repograph_search` queries with `limit: 10` or `exact_symbol_only: true` to prevent oversized result payloads from polluting the context window.\n\
+     6. **Closed-Loop MCP Mutation & Impact Analysis**:\n\
+        - Before modifying central interfaces, run `repograph_impact(symbol=\"<name>\")` or `repograph_callers` to evaluate downstream ripple effects.\n\
+        - Use `repograph_edit`, `repograph_batch_edit`, and `repograph_edit_symbol` for atomic refactors with instant AST re-indexing and rollback safety.\n\
+     7. **Turn Completion & Zero-Token Memory Offloading (End of Turn)**:\n\
+        - Update checklist and active goals in `.myrepograph-agent/memory/runtime/context.md` to offload working memory outside the model context window.\n\
+        - Append a session summary entry into `.myrepograph-agent/memory/runtime/dailylog.md` detailing what changed, edge diffs, verification commands executed, and any pending items.\n\
+     <!-- END REPO-GRAPH-SYNC-POLICY v1.4 -->\n\
      \n\
      # CONTEXT_ENGINEERING_PROMPT_ARCHITECTURE_MARKER\n\
      When answering architecture questions or researching dependencies, follow the Context Engineering Prompt Architecture (CEPA). Always execute the 3-step discovery sequence (Orient -> Target -> Explore Leanly) and default to `signature_only: true` on `repograph_explore` calls to minimize token ingestion.\n\
@@ -380,8 +403,7 @@ fn code_review_skill() -> &'static str {
      \n\
      ## 1. Scope the diff\n\
      Review what changed, plus what the change can break. Use\n\
-     `repograph_impact(path, symbol)` for the blast radius — pass **both**\n\
-     arguments; a bare symbol silently returns no callers.\n\
+     `repograph_impact(symbol=\"<name>\")` or `repograph_impact(path=\"<path>\")` for the blast radius.\n\
      \n\
      ## 2. Read what you are judging\n\
      Signatures are enough to map the call graph; they are not enough to review\n\
@@ -423,6 +445,44 @@ fn code_review_script() -> &'static str {
      echo \"== mechanical checks passed; review the logic by hand ==\"\n"
 }
 
+fn codebase_design_skill() -> &'static str {
+    "---\n\
+     name: codebase-design\n\
+     description: Architecture design vocabulary and principles for deepening modules, designing seams, and cutting complexity.\n\
+     ---\n\
+     \n\
+     # Codebase Design Vocabulary & Principles\n\
+     \n\
+     ## Core Architecture Vocabulary\n\
+     - **Module**: A cohesive unit of code hiding an implementation behind a well-defined interface. (Never call it a component or service).\n\
+     - **Interface**: The public surface area exposed by a module to callers.\n\
+     - **Depth (Deep Module)**: An interface that is simple and narrow while the implementation handles significant complexity.\n\
+     - **Shallow Module**: An interface as complex as its implementation. Collapse or delete.\n\
+     - **Seam**: A place where you can alter program behavior without changing calling code.\n\
+     - **Adapter**: A concrete implementation connecting a module to a runtime dependency.\n\
+     - **Leverage**: Functionality achieved per unit of interface learned.\n\
+     - **Locality**: Keeping related behaviors physically close.\n\
+     \n\
+     ## Key Principles\n\
+     - **The Deletion Test**: If deleting a module concentrates complexity, it was deep; if complexity just moves, it was shallow.\n\
+     - **Seams & Adapters Law**: One adapter = hypothetical seam; two adapters = real seam.\n\
+     - **The Interface is the Test Surface**: Tests target public module interfaces, not private internals.\n"
+}
+
+fn improve_codebase_architecture_skill() -> &'static str {
+    "---\n\
+     name: improve-codebase-architecture\n\
+     description: Scan a codebase for deepening opportunities, present them as a visual HTML report, and execute architectural refactoring.\n\
+     ---\n\
+     \n\
+     # Improve Codebase Architecture\n\
+     \n\
+     ## Process\n\
+     1. **Explore Hotspots**: Identify high-churn areas via `git log` and `repograph_impact`.\n\
+     2. **Visual HTML Report**: Generate self-contained before/after diagrams using CDN Tailwind and Mermaid in `%TEMP%`.\n\
+     3. **Grilling Loop**: Review decisions, update ADRs in `docs/adr/`, and refactor via `repograph_batch_edit`.\n"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,6 +519,8 @@ mod tests {
             "memory/runtime/dailylog.md",
             "skills/code-review/SKILL.md",
             "skills/code-review/review.sh",
+            "skills/codebase-design/SKILL.md",
+            "skills/improve-codebase-architecture/SKILL.md",
         ] {
             let p = base.join(file);
             assert!(p.is_file(), "missing file {file}");
@@ -477,7 +539,7 @@ mod tests {
         let base = root.join(SCAFFOLD_DIR);
 
         let yaml = fs::read_to_string(base.join("agent.yaml")).unwrap();
-        assert!(yaml.contains("architecture: \"CEPA-v1.1\""), "got {yaml}");
+        assert!(yaml.contains("architecture: \"CEPA-v1.4\""), "got {yaml}");
         // The workspace name is derived from the directory, not hardcoded.
         assert!(
             yaml.contains("name: repograph_scaffold_content"),
@@ -536,7 +598,7 @@ mod tests {
         fs::write(base.join("SOUL.md"), "custom soul").unwrap();
         fs::remove_file(base.join("DUTIES.md")).unwrap();
 
-        write_scaffold(&base, "x").unwrap();
+        ensure_agent_scaffold(&root).unwrap();
         assert!(base.join("DUTIES.md").is_file(), "deleted file not restored");
         assert_eq!(fs::read_to_string(base.join("SOUL.md")).unwrap(), "custom soul");
 

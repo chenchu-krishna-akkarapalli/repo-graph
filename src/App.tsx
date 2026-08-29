@@ -116,20 +116,24 @@ export default function App() {
     }
   }, [load])
 
-  if (activeProjectRoot === null) {
-    return <ProjectHubDashboard />
-  }
-
   return (
-    <div className="flex h-full flex-col">
-      <TopToolbar />
-      <main className="flex min-h-0 flex-1">
-        <LeftSidebar />
-        <section className="min-w-0 flex-1">
-          <GraphCanvas />
-        </section>
-        <DetailSidebar />
-      </main>
+    <div className="flex h-screen w-screen flex-col bg-[#060709] text-[#E2E8F0] overflow-hidden">
+      {activeProjectRoot === null ? (
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+          <ProjectHubDashboard />
+        </div>
+      ) : (
+        <>
+          <TopToolbar />
+          <main className="flex min-h-0 flex-1 overflow-hidden">
+            <LeftSidebar />
+            <section className="min-w-0 flex-1">
+              <GraphCanvas />
+            </section>
+            <DetailSidebar />
+          </main>
+        </>
+      )}
       <StatusBar />
       <CEPAUserGuideModal open={showCEPATour} onClose={() => setShowCEPATour(false)} />
     </div>

@@ -16,33 +16,33 @@ interface SymbolNodeData {
  *  purple default — tuned against the #090A0F canvas. */
 const KIND_THEMES = {
   route: {
-    container: 'border-emerald-500/40 bg-[#0F241B]/90 text-emerald-300 hover:border-emerald-400/80 shadow-md',
+    container: 'border-emerald-500/30 bg-[#0F241B]/60 text-emerald-300 hover:border-emerald-400/80 shadow-md shadow-black/40 backdrop-blur-xl',
     handle: '!bg-emerald-400',
   },
   component: {
-    container: 'border-cyan-500/40 bg-[#0F2028]/90 text-cyan-300 hover:border-cyan-400/80 shadow-md',
+    container: 'border-cyan-500/30 bg-[#0F2028]/60 text-cyan-300 hover:border-cyan-400/80 shadow-md shadow-black/40 backdrop-blur-xl',
     handle: '!bg-cyan-400',
   },
   /** Zustand/Redux/Context/Pinia/Vuex/MobX containers — amber reads as
    *  "shared mutable state", distinct from routes and components. */
   state_store: {
-    container: 'border-amber-500/40 bg-[#261d10]/90 text-amber-300 hover:border-amber-400 shadow-md',
+    container: 'border-amber-500/30 bg-[#261d10]/60 text-amber-300 hover:border-amber-400 shadow-md shadow-black/40 backdrop-blur-xl',
     handle: '!bg-amber-400',
   },
   /** ORM models / table declarations — indigo reads as "persisted data",
    *  a different axis from runtime state (amber) or transport (emerald). */
   database_schema: {
-    container: 'border-indigo-500/40 bg-[#17162e]/90 text-indigo-300 hover:border-indigo-400 shadow-md',
+    container: 'border-indigo-500/30 bg-[#17162e]/60 text-indigo-300 hover:border-indigo-400 shadow-md shadow-black/40 backdrop-blur-xl',
     handle: '!bg-indigo-400',
   },
   /** Pub/sub topics and emitter events — rose signals "fires elsewhere",
    *  which is what makes these edges hard to follow by reading code. */
   event_channel: {
-    container: 'border-rose-500/40 bg-[#281519]/90 text-rose-300 hover:border-rose-400 shadow-md',
+    container: 'border-rose-500/30 bg-[#281519]/60 text-rose-300 hover:border-rose-400 shadow-md shadow-black/40 backdrop-blur-xl',
     handle: '!bg-rose-400',
   },
   default: {
-    container: 'border-purple-500/40 bg-[#1A1528]/90 text-purple-300 hover:border-purple-400/80 shadow-md',
+    container: 'border-purple-500/30 bg-[#1A1528]/60 text-purple-300 hover:border-purple-400/80 shadow-md shadow-black/40 backdrop-blur-xl',
     handle: '!bg-violet-400',
   },
 } as const

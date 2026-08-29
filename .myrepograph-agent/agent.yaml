@@ -1,8 +1,8 @@
-# Repo Graph agent workspace descriptor.
+﻿# Repo Graph agent workspace descriptor.
 # Generated once; edit freely — re-indexing never overwrites this file.
 name: project-map
 version: 0.1.0
-architecture: "CEPA-v1.1"
+architecture: "CEPA-v1.3"
 
 context_stack:
   instructions: RULES.md
@@ -21,3 +21,5 @@ agents:
   - agents/fact-checker
 skills:
   - skills/code-review
+  - skills/codebase-design
+  - skills/improve-codebase-architecture

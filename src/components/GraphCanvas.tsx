@@ -119,6 +119,7 @@ function Canvas() {
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setFlow(EMPTY_FLOW)
       setIngestingCount(0)
+      fittedGraphRef.current = null
       return
     }
     const build = () =>

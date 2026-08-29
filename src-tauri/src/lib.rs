@@ -1,3 +1,4 @@
+pub mod agent_scaffold;
 pub mod cluster;
 pub mod db;
 pub mod graph;
@@ -7,6 +8,9 @@ pub mod mcp_server;
 pub mod parsers;
 pub mod paths;
 pub mod rank;
+pub mod rule_injector;
+pub mod skeleton;
+pub mod telemetry;
 pub mod tokens;
 pub mod tree;
 pub mod walker;

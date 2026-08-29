@@ -152,6 +152,20 @@ indistinguishable from an empty repository.
   task. This is where the "90%+ savings" claim comes from — it's the ratio
   of (manifest + few file reads) to (whole repo dump).
 
+## Search & Exploration Token Optimization (`repograph_search` & `repograph_explore`)
+
+| Tool Method | Token Usage | Target Use Case |
+|:---|:---|:---|
+| `repograph_explore(symbols, signature_only: true)` | **~800 tokens** (92% savings) | Retrieve call graph, callers, and declaration signatures without body dumps. |
+| `repograph_callers(symbol)` | **~300 tokens** | Find exact list of calling components without code bodies. |
+| `repograph_node(path)` | **~200 tokens** | Read exact single-file definition. |
+| `repograph_search(query, limit: 5)` | **~400 tokens** | Paginated symbol definition locator with 3-line context snippets. |
+
+### Search Optimizations (`repograph_search`)
+1. **Default `signature_only = true`:** Returns compact declaration heads (`signature`) rather than full 250+ line JSX/AST bodies (`content`), slashing response size by >90%.
+2. **Default `limit = 10`:** Prevents high-frequency component references from overflowing model context windows.
+3. **3-Line Grep Context Snippets:** Body matches extract a 3-line localized snippet (`extract_3line_snippet`) around the matching line instead of ingesting entire file ASTs.
+
 ## Validation
 
 All three are implemented and run in CI (`.github/workflows/ci.yml`):

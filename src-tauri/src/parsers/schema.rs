@@ -92,6 +92,7 @@ pub fn scan_js(source: &str) -> Vec<Detected> {
     let typeorm = mentions("typeorm");
     let sequelize = mentions("sequelize");
     let mongoose = mentions("mongoose");
+    let zod = mentions("zod") || source.contains("z.object") || source.contains("z.record");
     let trpc = mentions("@trpc") || mentions("trpc");
     let graphql = mentions("graphql") || mentions("apollo");
     let rxjs = mentions("rxjs");
@@ -131,6 +132,13 @@ pub fn scan_js(source: &str) -> Vec<Detected> {
 
         if drizzle {
             for factory in ["pgTable", "mysqlTable", "sqliteTable"] {
+                if let Some(name) = binding_for(raw, factory) {
+                    push_unique(&mut out, name, line_no, DATABASE_SCHEMA);
+                }
+            }
+        }
+        if zod {
+            for factory in ["z.object", "z.discriminatedUnion", "z.record", "z.enum"] {
                 if let Some(name) = binding_for(raw, factory) {
                     push_unique(&mut out, name, line_no, DATABASE_SCHEMA);
                 }
@@ -182,7 +190,7 @@ pub fn scan_js(source: &str) -> Vec<Detected> {
         }
 
         if rxjs {
-            for factory in ["Subject", "BehaviorSubject", "ReplaySubject", "EventEmitter"] {
+            for factory in ["Subject", "BehaviorSubject", "ReplaySubject"] {
                 if let Some(name) = binding_for(raw, factory) {
                     push_unique(&mut out, name, line_no, EVENT_CHANNEL);
                 }
@@ -190,8 +198,8 @@ pub fn scan_js(source: &str) -> Vec<Detected> {
         }
         if emitter {
             for call in [".emit", ".on", ".once", ".addListener"] {
-                if let Some(topic) = string_arg_of(raw, call) {
-                    push_unique(&mut out, topic, line_no, EVENT_CHANNEL);
+                if let Some(evt) = string_arg_of(raw, call) {
+                    push_unique(&mut out, evt, line_no, EVENT_CHANNEL);
                 }
             }
         }
@@ -211,11 +219,12 @@ pub fn scan_js(source: &str) -> Vec<Detected> {
     out
 }
 
-/// Python: SQLAlchemy declarative models, Django models, Redis/Kafka pub-sub.
+/// Python: SQLAlchemy declarative models, Django models, Pydantic BaseModel, Redis/Kafka pub-sub.
 pub fn scan_python(source: &str) -> Vec<Detected> {
     let mentions = |needle: &str| source.contains(needle);
     let sqlalchemy = mentions("sqlalchemy") || mentions("SQLModel");
     let django = mentions("django") || mentions("models.Model");
+    let pydantic = mentions("pydantic") || mentions("BaseModel");
     let redis = mentions("redis");
     let kafka = mentions("kafka");
 
@@ -242,11 +251,13 @@ pub fn scan_python(source: &str) -> Vec<Detected> {
         }
         let line = raw.trim();
 
-        if (sqlalchemy || django) && line.starts_with("class ") {
+        if (sqlalchemy || django || pydantic) && line.starts_with("class ") {
             let after = &line["class ".len()..];
             let name: String = after.chars().take_while(|c| ident_char(*c)).collect();
             let bases: String = after.chars().skip_while(|c| ident_char(*c)).collect();
             let is_model = bases.contains("Base")
+                || bases.contains("BaseModel")
+                || bases.contains("BaseSettings")
                 || bases.contains("models.Model")
                 || bases.contains("SQLModel")
                 || bases.contains("DeclarativeBase");
@@ -702,5 +713,14 @@ pub struct Post {
         apply(&[Detected { name: "User".to_string(), line: 10, kind: DATABASE_SCHEMA }], &mut symbols);
         assert_eq!(symbols[0].kind, DATABASE_SCHEMA);
         assert_eq!((symbols[0].start_line, symbols[0].end_line), (10, 40));
+    }
+
+    #[test]
+    fn zod_and_pydantic_models_are_detected() {
+        let ts = "import { z } from 'zod';\nexport const userSchema = z.object({ id: z.string() });";
+        assert_eq!(of_kind(&scan_js(ts), DATABASE_SCHEMA), vec!["userSchema".to_string()]);
+
+        let py = "from pydantic import BaseModel\nclass UserProfile(BaseModel):\n    name: str\n";
+        assert_eq!(of_kind(&scan_python(py), DATABASE_SCHEMA), vec!["UserProfile".to_string()]);
     }
 }

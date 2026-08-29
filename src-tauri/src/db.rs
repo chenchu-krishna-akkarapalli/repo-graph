@@ -5,8 +5,12 @@ use serde_json;
 
 pub fn init_db(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA busy_timeout = 5000;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA foreign_keys = ON;",
+    )?;
 
     let has_exports = conn.prepare("SELECT exports FROM files LIMIT 1").is_ok();
     if !has_exports {
@@ -95,10 +99,24 @@ pub fn init_db(db_path: &Path) -> Result<Connection> {
             symbol TEXT NOT NULL,
             path TEXT NOT NULL,
             action TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            raw_tokens INTEGER NOT NULL DEFAULT 0,
+            saved_tokens INTEGER NOT NULL DEFAULT 0,
+            execution_ms INTEGER NOT NULL DEFAULT 0,
+            turn_id INTEGER NOT NULL DEFAULT 1,
             timestamp INTEGER NOT NULL
         )",
         [],
     )?;
+
+    // Safe backward-compatible migrations for existing agent_queries tables
+    let _ = conn.execute("ALTER TABLE agent_queries ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0", []);
+    let _ = conn.execute("ALTER TABLE agent_queries ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0", []);
+    let _ = conn.execute("ALTER TABLE agent_queries ADD COLUMN raw_tokens INTEGER NOT NULL DEFAULT 0", []);
+    let _ = conn.execute("ALTER TABLE agent_queries ADD COLUMN saved_tokens INTEGER NOT NULL DEFAULT 0", []);
+    let _ = conn.execute("ALTER TABLE agent_queries ADD COLUMN execution_ms INTEGER NOT NULL DEFAULT 0", []);
+    let _ = conn.execute("ALTER TABLE agent_queries ADD COLUMN turn_id INTEGER NOT NULL DEFAULT 1", []);
 
     // Files edited but not yet re-indexed. This lives in the database rather
     // than a process-local static because the watcher runs inside the Tauri
@@ -797,8 +815,10 @@ pub fn populate_db(conn: &mut Connection, parsed_files: &[ParsedFile], root: &Pa
 }
 
 pub fn get_symbol_range(conn: &Connection, file_path: &str, name: &str) -> Result<Option<(usize, usize)>> {
-    let mut stmt = conn.prepare("SELECT start_line, end_line FROM symbols WHERE file_path = ? AND name = ? LIMIT 1")?;
-    let mut rows = stmt.query(params![file_path, name])?;
+    let clean = file_path.trim_start_matches('/').trim_start_matches('\\');
+    let with_slash = format!("/{clean}");
+    let mut stmt = conn.prepare("SELECT start_line, end_line FROM symbols WHERE (file_path = ? OR file_path = ?) AND name = ? LIMIT 1")?;
+    let mut rows = stmt.query(params![clean, with_slash, name])?;
     if let Some(row) = rows.next()? {
         let start: i64 = row.get(0)?;
         let end: i64 = row.get(1)?;
@@ -944,7 +964,12 @@ pub fn get_all_symbols(conn: &Connection) -> Result<std::collections::HashMap<St
 pub struct SymbolSearchResult {
     pub name: String,
     pub file_path: String,
-    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -973,6 +998,259 @@ pub struct ExplorePathEdge {
 pub struct ExplorePayload {
     pub files: Vec<ExploreFilePayload>,
     pub paths: Vec<ExplorePathEdge>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ExecutionTraceHop {
+    pub depth: usize,
+    pub file_path: String,
+    pub symbol_name: String,
+    pub kind: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub signature: String,
+}
+
+fn extract_signature_from_lines(lines: &[&str], start: usize, end: usize) -> String {
+    if start == 0 || start > lines.len() {
+        return String::new();
+    }
+    let last = end.min(lines.len()).max(start);
+    let mut collected = Vec::new();
+    for line in &lines[start - 1..last] {
+        collected.push(*line);
+        let trimmed = line.trim_end();
+        let opens_body = trimmed.ends_with('{')
+            || trimmed.ends_with(':')
+            || trimmed.ends_with("=>")
+            || trimmed.ends_with(';')
+            || trimmed.ends_with("({");
+        if opens_body || collected.len() >= 4 {
+            break;
+        }
+    }
+    let mut out = collected.join("\n");
+    while out.ends_with('{') || out.ends_with(char::is_whitespace) {
+        out.pop();
+    }
+    out
+}
+
+pub fn get_execution_trace(
+    conn: &Connection,
+    root: &Path,
+    entrypoint: &str,
+    max_depth: usize,
+) -> std::result::Result<(String, Vec<String>), String> {
+    let bounded_depth = max_depth.clamp(1, 4) as i64;
+    let clean_entry = entrypoint.trim();
+
+    // 1. Anchor Query with Exact Match First, Fallback to Like
+    let query_sql = r#"
+    WITH RECURSIVE
+    anchor AS (
+        SELECT 
+            s.id AS symbol_id,
+            s.name AS symbol_name,
+            s.file_path AS file_path,
+            s.kind AS symbol_kind,
+            s.start_line AS start_line,
+            s.end_line AS end_line,
+            0 AS depth,
+            CAST(s.id AS TEXT) AS id_trail
+        FROM symbols s
+        WHERE s.name = ?1
+           OR s.file_path = ?1
+           OR (s.file_path || ':' || s.name) = ?1
+           OR (s.file_path || '#' || s.name) = ?1
+        LIMIT 3
+    ),
+    call_chain AS (
+        SELECT symbol_id, symbol_name, file_path, symbol_kind, start_line, end_line, depth, id_trail
+        FROM anchor
+
+        UNION ALL
+
+        SELECT 
+            target.id,
+            target.name,
+            target.file_path,
+            target.kind,
+            target.start_line,
+            target.end_line,
+            cc.depth + 1,
+            cc.id_trail || ',' || CAST(target.id AS TEXT)
+        FROM call_chain cc
+        JOIN edges e ON e.from_symbol_id = cc.symbol_id
+        JOIN symbols target ON target.id = e.to_symbol_id
+        WHERE cc.depth < ?2
+          AND e.kind IN ('call', 'invokes', 'dispatches', 'route')
+          AND (',' || cc.id_trail || ',') NOT LIKE ('%,' || target.id || ',%')
+          AND target.name NOT IN ('log', 'info', 'warn', 'error', 'debug', 'print', 'println', 'format', 'panic', 'assert')
+    )
+    SELECT depth, file_path, symbol_name, symbol_kind, start_line, end_line
+    FROM call_chain
+    ORDER BY depth ASC, file_path ASC
+    LIMIT 50;
+    "#;
+
+    let mut stmt = conn.prepare(query_sql).map_err(|e| format!("failed to prepare CTE: {e}"))?;
+    let rows = stmt.query_map(params![clean_entry, bounded_depth], |row| {
+        Ok((
+            row.get::<_, i64>(0)? as usize,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)? as usize,
+            row.get::<_, i64>(5)? as usize,
+        ))
+    }).map_err(|e| format!("CTE query error: {e}"))?;
+
+    let mut hops_raw: Vec<(usize, String, String, String, usize, usize)> = rows.filter_map(|r| r.ok()).collect();
+
+    // Fallback if exact matching found 0 symbols
+    if hops_raw.is_empty() {
+        let fallback_sql = r#"
+        WITH RECURSIVE
+        anchor AS (
+            SELECT 
+                s.id AS symbol_id,
+                s.name AS symbol_name,
+                s.file_path AS file_path,
+                s.kind AS symbol_kind,
+                s.start_line AS start_line,
+                s.end_line AS end_line,
+                0 AS depth,
+                CAST(s.id AS TEXT) AS id_trail
+            FROM symbols s
+            WHERE s.name LIKE '%' || ?1 || '%'
+            LIMIT 3
+        ),
+        call_chain AS (
+            SELECT symbol_id, symbol_name, file_path, symbol_kind, start_line, end_line, depth, id_trail
+            FROM anchor
+
+            UNION ALL
+
+            SELECT 
+                target.id,
+                target.name,
+                target.file_path,
+                target.kind,
+                target.start_line,
+                target.end_line,
+                cc.depth + 1,
+                cc.id_trail || ',' || CAST(target.id AS TEXT)
+            FROM call_chain cc
+            JOIN edges e ON e.from_symbol_id = cc.symbol_id
+            JOIN symbols target ON target.id = e.to_symbol_id
+            WHERE cc.depth < ?2
+              AND e.kind IN ('call', 'invokes', 'dispatches', 'route')
+              AND (',' || cc.id_trail || ',') NOT LIKE ('%,' || target.id || ',%')
+              AND target.name NOT IN ('log', 'info', 'warn', 'error', 'debug', 'print', 'println', 'format', 'panic', 'assert')
+        )
+        SELECT depth, file_path, symbol_name, symbol_kind, start_line, end_line
+        FROM call_chain
+        ORDER BY depth ASC, file_path ASC
+        LIMIT 50;
+        "#;
+        let mut fb_stmt = conn.prepare(fallback_sql).map_err(|e| format!("failed to prepare fallback CTE: {e}"))?;
+        let fb_rows = fb_stmt.query_map(params![clean_entry, bounded_depth], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as usize,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)? as usize,
+                row.get::<_, i64>(5)? as usize,
+            ))
+        }).map_err(|e| format!("fallback CTE error: {e}"))?;
+        hops_raw = fb_rows.filter_map(|r| r.ok()).collect();
+    }
+
+    if hops_raw.is_empty() {
+        return Ok((
+            format!("No execution trace or symbol matching '{entrypoint}' found in graph index."),
+            Vec::new(),
+        ));
+    }
+
+    // Cache file lines on disk
+    let mut file_contents: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut unique_files_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (_, f_path, _, _, _, _) in &hops_raw {
+        unique_files_set.insert(f_path.clone());
+        if !file_contents.contains_key(f_path) {
+            let abs = root.join(f_path);
+            let lines = std::fs::read_to_string(&abs)
+                .map(|c| c.lines().map(String::from).collect())
+                .unwrap_or_default();
+            file_contents.insert(f_path.clone(), lines);
+        }
+    }
+
+    let mut hops: Vec<ExecutionTraceHop> = Vec::new();
+    let mut max_depth_seen = 0;
+
+    for (depth, f_path, sym_name, kind, start, end) in hops_raw {
+        if depth > max_depth_seen {
+            max_depth_seen = depth;
+        }
+        let sig = if let Some(lines) = file_contents.get(&f_path) {
+            let str_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+            extract_signature_from_lines(&str_refs, start, end)
+        } else {
+            String::new()
+        };
+        let final_sig = if sig.trim().is_empty() {
+            format!("{kind} {sym_name}")
+        } else {
+            sig
+        };
+        hops.push(ExecutionTraceHop {
+            depth,
+            file_path: f_path,
+            symbol_name: sym_name,
+            kind,
+            start_line: start,
+            end_line: end,
+            signature: final_sig,
+        });
+    }
+
+    let unique_files: Vec<String> = unique_files_set.into_iter().collect();
+
+    // Render formatted markdown
+    let mut md = format!(
+        "### Execution Trace: `{entrypoint}` (Max Depth: {max_depth_seen})\nTraced across {} execution steps in {} files:\n\n",
+        hops.len(),
+        unique_files.len()
+    );
+
+    for hop in &hops {
+        let indent = "    ".repeat(hop.depth);
+        let prefix = if hop.depth == 0 {
+            format!("[Hop 0] {}:{} ({})\n", hop.file_path, hop.start_line, hop.kind)
+        } else {
+            format!("{indent}└── [Hop {}] {}:{} ({})\n", hop.depth, hop.file_path, hop.start_line, hop.kind)
+        };
+        md.push_str(&prefix);
+        for sig_line in hop.signature.lines() {
+            if hop.depth == 0 {
+                md.push_str(&format!("`{sig_line}`\n"));
+            } else {
+                md.push_str(&format!("{indent}    `{sig_line}`\n"));
+            }
+        }
+        md.push('\n');
+    }
+
+    if hops.len() == 1 {
+        md.push_str("(Leaf execution node or dynamic runtime dispatch — 0 static downstream call edges)\n");
+    }
+
+    Ok((md, unique_files))
 }
 
 pub fn reconcile_repo_startup(root: &Path) -> std::result::Result<(), String> {
@@ -1580,9 +1858,36 @@ const AGENT_QUERY_LOG_LIMIT: i64 = 2_000;
 /// re-runs ~10 DDL statements and a `PRAGMA table_info` probe — once per
 /// logged query, and `explore` logs once per requested symbol.
 pub fn log_agent_query(conn: &Connection, symbol: &str, path: &str, action: &str) {
+    log_agent_query_metrics(conn, symbol, path, action, 0, 0, 0, 0, 0, 1);
+}
+
+/// Record one agent tool call with exact BPE metrics.
+pub fn log_agent_query_metrics(
+    conn: &Connection,
+    symbol: &str,
+    path: &str,
+    action: &str,
+    input_tokens: usize,
+    output_tokens: usize,
+    raw_tokens: usize,
+    saved_tokens: usize,
+    execution_ms: u128,
+    turn_id: usize,
+) {
     let _ = conn.execute(
-        "INSERT INTO agent_queries (symbol, path, action, timestamp) VALUES (?, ?, ?, ?)",
-        params![symbol, path, action, chrono::Utc::now().timestamp_millis()],
+        "INSERT INTO agent_queries (symbol, path, action, input_tokens, output_tokens, raw_tokens, saved_tokens, execution_ms, turn_id, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            symbol,
+            path,
+            action,
+            input_tokens as i64,
+            output_tokens as i64,
+            raw_tokens as i64,
+            saved_tokens as i64,
+            execution_ms as i64,
+            turn_id as i64,
+            chrono::Utc::now().timestamp_millis()
+        ],
     );
     let _ = conn.execute(
         "DELETE FROM agent_queries WHERE id <= (
@@ -1795,6 +2100,53 @@ mod tests {
             symbol_rows, 2,
             "expected the file node + doThing, got {symbol_rows}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_get_execution_trace_multi_hop() {
+        let dir = std::env::temp_dir().join("repograph_trace_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(
+            dir.join("routes.ts"),
+            "export async function checkoutHandler(req: Request) {\n    return validateCart();\n}\n"
+        ).unwrap();
+        std::fs::write(
+            dir.join("cart.ts"),
+            "export function validateCart() {\n    return checkStock();\n}\n"
+        ).unwrap();
+        std::fs::write(
+            dir.join("db.ts"),
+            "export function checkStock() {\n    return true;\n}\n"
+        ).unwrap();
+
+        let conn = init_db(&dir.join("graph.db")).unwrap();
+        
+        // Insert files
+        conn.execute("INSERT INTO files (path, size_bytes, language) VALUES ('routes.ts', 100, 'typescript')", []).unwrap();
+        conn.execute("INSERT INTO files (path, size_bytes, language) VALUES ('cart.ts', 100, 'typescript')", []).unwrap();
+        conn.execute("INSERT INTO files (path, size_bytes, language) VALUES ('db.ts', 100, 'typescript')", []).unwrap();
+
+        // Insert symbols
+        conn.execute("INSERT INTO symbols (id, file_path, name, kind, start_line, end_line) VALUES (1, 'routes.ts', 'checkoutHandler', 'function', 1, 3)", []).unwrap();
+        conn.execute("INSERT INTO symbols (id, file_path, name, kind, start_line, end_line) VALUES (2, 'cart.ts', 'validateCart', 'function', 1, 3)", []).unwrap();
+        conn.execute("INSERT INTO symbols (id, file_path, name, kind, start_line, end_line) VALUES (3, 'db.ts', 'checkStock', 'function', 1, 3)", []).unwrap();
+
+        // Insert call edges: checkoutHandler -> validateCart -> checkStock
+        conn.execute("INSERT INTO edges (from_symbol_id, to_symbol_id, kind, provenance) VALUES (1, 2, 'call', 'ast')", []).unwrap();
+        conn.execute("INSERT INTO edges (from_symbol_id, to_symbol_id, kind, provenance) VALUES (2, 3, 'call', 'ast')", []).unwrap();
+
+        let (trace_md, unique_files) = get_execution_trace(&conn, &dir, "checkoutHandler", 3).unwrap();
+        assert!(trace_md.contains("checkoutHandler"));
+        assert!(trace_md.contains("validateCart"));
+        assert!(trace_md.contains("checkStock"));
+        assert!(trace_md.contains("[Hop 0] routes.ts:1"));
+        assert!(trace_md.contains("[Hop 1] cart.ts:1"));
+        assert!(trace_md.contains("[Hop 2] db.ts:1"));
+        assert_eq!(unique_files.len(), 3);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

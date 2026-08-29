@@ -1,7 +1,3 @@
-# Master Context Engineering & Behavioral Token Rules
-
-This directory serves as the centralized source of truth for AI coding agents operating within the Repo Graph repository.
-
 <!-- BEGIN REPO-GRAPH-SYNC-POLICY v1.4 -->
 # MCP Continuous Sync & Strict Token Cost-Cutting Policy
 
@@ -27,27 +23,5 @@ This directory serves as the centralized source of truth for AI coding agents op
    - Append a session summary entry into `.myrepograph-agent/memory/runtime/dailylog.md` detailing what changed, edge diffs, verification commands executed, and any pending items.
 <!-- END REPO-GRAPH-SYNC-POLICY v1.4 -->
 
----
-
-## Behavioral Token Cost-Cutting Protocol
-
-1. **High In-Degree Core Files (Interfaces/Handlers)**:
-   - Ingest signatures only (`signature_only: true`) to understand architecture and call graphs without wasting budget on implementation bodies.
-2. **Low In-Degree Leaf Files (Implementations)**:
-   - Use sliced line-range reads (`start_line`, `end_line`, `with_line_numbers: true`) via `repograph_node` instead of reading full files.
-3. **Folder Scopes**:
-   - Bound manifest and exploration queries using `repograph_files(scope: "<folder>/**")` or domain filters.
-4. **Transient State Offloading**:
-   - Offload and track multi-turn session state and execution progress in `.myrepograph-agent/memory/runtime/context.md`.
-5. **Codebase Architecture & Deepening**:
-   - Follow the shared design vocabulary in `skills/codebase-design` and execute visual refactoring reviews via `skills/improve-codebase-architecture`.
-
-# CONTEXT_ENGINEERING_PROMPT_ARCHITECTURE_MARKER
-When answering architecture questions or researching dependencies, follow the Context Engineering Prompt Architecture (CEPA). Always execute the 3-step discovery sequence (Orient -> Target -> Explore Leanly) and default to `signature_only: true` on `repograph_explore` calls to minimize token ingestion.
-
-1. **Orient** — `repograph_status`, then `repograph_files(scope)` for the area in question.
-2. **Target** — `repograph_search(query, limit: 10)` to isolate candidate identifiers.
-3. **Explore Leanly** — `repograph_explore(symbols, signature_only: true)` for declarations plus the call graph.
-
-Exception — code writes: before modifying, refactoring, or debugging the behaviour of a symbol, re-call `repograph_explore` WITHOUT `signature_only` to load the implementation body. Never edit code from a signature alone.
-# END_CONTEXT_ENGINEERING_PROMPT_ARCHITECTURE_MARKER
+> **Context Engineering & Token Optimization Delegation:**
+> Detailed file/folder token cutting policies, transient state offloading, and behavioral rules are centrally defined in [`.myrepograph-agent/RULES.md`](file:///c:/My-pro/project-map/.myrepograph-agent/RULES.md). All agents must strictly follow these rules.

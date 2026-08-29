@@ -20,9 +20,13 @@ fn db_path_for(root: &Path) -> PathBuf {
 /// Repo-relative, forward-slashed form of `path` — the key shape used
 /// everywhere else in the index.
 fn relative_key(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
+    let canonical_root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let canonical_path = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let rel = canonical_path
+        .strip_prefix(&canonical_root)
+        .or_else(|_| path.strip_prefix(root))
+        .unwrap_or(path);
+    rel.to_string_lossy()
         .replace('\\', "/")
 }
 
@@ -79,14 +83,14 @@ pub fn start_watcher(app_handle: AppHandle, root: PathBuf) {
     let debounce_ms = std::env::var("CODEGRAPH_WATCH_DEBOUNCE_MS")
         .ok()
         .and_then(|val| val.parse::<u64>().ok())
-        .map(|val| val.clamp(100, 60000))
-        .unwrap_or(2000);
+        .map(|val| val.clamp(50, 60000))
+        .unwrap_or(150);
 
     let root_clone = root.clone();
     let app_clone = app_handle.clone();
     std::thread::spawn(move || {
         loop {
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(50));
             // A newer root took over — retire rather than keep re-indexing a
             // project the user has already closed.
             if WATCH_GENERATION.load(Ordering::SeqCst) != generation {
@@ -165,6 +169,83 @@ pub fn start_watcher(app_handle: AppHandle, root: PathBuf) {
     Box::leak(Box::new(watcher));
 }
 
+/// Standalone watcher for MCP server process without a Tauri AppHandle.
+pub fn start_standalone_watcher(root: PathBuf) {
+    let root = match dunce::canonicalize(&root).or_else(|_| root.canonicalize()) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+
+    let debounce_ms = std::env::var("CODEGRAPH_WATCH_DEBOUNCE_MS")
+        .ok()
+        .and_then(|val| val.parse::<u64>().ok())
+        .map(|val| val.clamp(50, 60000))
+        .unwrap_or(150);
+
+    let root_clone = root.clone();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_millis(50));
+
+            let now = chrono::Utc::now().timestamp_millis();
+            let due: Vec<String> = get_pending_map(&root_clone)
+                .into_iter()
+                .filter(|&(_, marked_at)| now.saturating_sub(marked_at) >= debounce_ms as i64)
+                .map(|(path, _)| path)
+                .collect();
+
+            if due.is_empty() {
+                continue;
+            }
+
+            let mut any_ok = false;
+            for rel in due {
+                match sync_path(&root_clone, &rel) {
+                    Ok(()) => any_ok = true,
+                    Err(e) => eprintln!("[watcher] failed to sync {rel}: {e}"),
+                }
+                if let Ok(conn) = crate::db::init_db(&db_path_for(&root_clone)) {
+                    crate::db::clear_pending(&conn, &rel);
+                }
+            }
+            if any_ok {
+                if let Ok(conn) = crate::db::init_db(&db_path_for(&root_clone)) {
+                    if let Ok(graph) = crate::db::load_graph_from_db(&conn) {
+                        let _ = graph.save_to_cache(&root_clone);
+                    }
+                }
+            }
+        }
+    });
+
+    let filter_root = root.clone();
+    let mut watcher = match notify::recommended_watcher(
+        move |res: Result<notify::Event, notify::Error>| {
+            let Ok(event) = res else { return };
+            if matches!(event.kind, EventKind::Access(_)) {
+                return;
+            }
+            for path in event.paths {
+                if is_supported_file(&filter_root, &path) {
+                    mark_pending(&filter_root, &path);
+                }
+            }
+        },
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("[watcher] failed to start standalone watcher: {e}");
+            return;
+        }
+    };
+
+    if let Err(e) = watcher.watch(&root, RecursiveMode::Recursive) {
+        eprintln!("[watcher] failed to watch root: {e}");
+    }
+
+    Box::leak(Box::new(watcher));
+}
+
 /// Gate watcher events through the **same** denylist the walker uses.
 ///
 /// This previously kept a private list naming only `.git`, `node_modules` and
@@ -174,7 +255,12 @@ pub fn start_watcher(app_handle: AppHandle, root: PathBuf) {
 /// of its thousands of symbols stored a ~190 KB source slice in `symbols_fts`.
 /// That alone grew the cache to 664 MB and hung startup reconciliation.
 fn is_supported_file(root: &Path, path: &Path) -> bool {
-    let relative = path.strip_prefix(root).unwrap_or(path);
+    let canonical_root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let canonical_path = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let relative = canonical_path
+        .strip_prefix(&canonical_root)
+        .or_else(|_| path.strip_prefix(root))
+        .unwrap_or(path);
     for component in relative.components() {
         let name = component.as_os_str().to_string_lossy();
         if crate::walker::SKIP_DIRS.contains(&name.as_ref()) {
@@ -192,7 +278,7 @@ fn is_supported_file(root: &Path, path: &Path) -> bool {
 }
 
 /// Re-index one changed path — or purge it if it no longer exists.
-fn sync_path(root: &Path, rel_path: &str) -> Result<(), String> {
+pub fn sync_path(root: &Path, rel_path: &str) -> Result<(), String> {
     let abs = root.join(rel_path);
     if !abs.is_file() {
         return purge_file(root, rel_path);
@@ -326,5 +412,49 @@ mod tests {
         let root = Path::new("C:/repo");
         assert!(!is_supported_file(root, &root.join(".env")));
         assert!(!is_supported_file(root, &root.join("config/.env.production")));
+    }
+
+    #[test]
+    fn standalone_watcher_reindexes_modified_file_in_realtime() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("repograph-watch-test-{nanos}"));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/lib.ts"),
+            "export const initialVal = 10;\n",
+        )
+        .unwrap();
+
+        let _ = crate::indexer::index_repo(&root, None);
+        start_standalone_watcher(root.clone());
+        std::thread::sleep(Duration::from_millis(100));
+
+        std::fs::write(
+            root.join("src/lib.ts"),
+            "export const updatedVal = 42;\nexport const newHelper = () => true;\n",
+        )
+        .unwrap();
+
+        let db = db_path_for(&root);
+        let mut updated = false;
+        for _ in 0..25 {
+            std::thread::sleep(Duration::from_millis(50));
+            if let Ok(conn) = crate::db::init_db(&db) {
+                if let Ok(all_symbols) = crate::db::get_all_symbols(&conn) {
+                    let symbols = all_symbols.get("src/lib.ts").cloned().unwrap_or_default();
+                    let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+                    if names.contains(&"updatedVal") || names.contains(&"newHelper") {
+                        updated = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(updated, "Watcher failed to incrementally reindex modified file within timeout");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
